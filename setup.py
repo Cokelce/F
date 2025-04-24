@@ -297,4 +297,4 @@ if __name__ == "__main__":
         print("\n安装程序遇到错误，请解决后重试")
     
     print("\n按回车键退出...", end="")
-    input() 
+    input()

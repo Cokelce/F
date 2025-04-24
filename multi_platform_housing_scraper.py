@@ -14,6 +14,10 @@ from datetime import datetime
 from fake_useragent import UserAgent
 import json
 import sys
+import numpy as np
+import urllib.parse
+import traceback
+from openpyxl.utils import get_column_letter
 
 # 配置日志
 logging.basicConfig(
@@ -26,6 +30,36 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("housing_scraper")
+
+# 设置更详细的调试级别
+def set_debug_level(debug=False):
+    """设置日志级别
+    
+    参数:
+        debug: 是否开启调试模式
+    """
+    if debug:
+        logger.setLevel(logging.DEBUG)
+        logger.debug("调试模式已启用")
+    else:
+        logger.setLevel(logging.INFO)
+        
+# 自定义异常类
+class ScraperException(Exception):
+    """爬虫异常基类"""
+    pass
+    
+class VerificationException(ScraperException):
+    """验证失败异常"""
+    pass
+    
+class ParsingException(ScraperException):
+    """解析失败异常"""
+    pass
+    
+class NetworkException(ScraperException):
+    """网络请求异常"""
+    pass
 
 # 尝试导入自动验证处理器
 try:
@@ -57,9 +91,9 @@ URL_TEMPLATES = {
         '租房': 'https://{city}.anjuke.com/rent/p{page}'
     },
     '58同城': {
-        '新房': 'https://{city}.58.com/loupan/p{page}/',
-        '二手房': 'https://{city}.58.com/ershoufang/p{page}/',
-        '租房': 'https://{city}.58.com/zufang/p{page}/'
+        'new': 'https://{city}.58.com/loupan/',
+        'second': 'https://{city}.58.com/ershoufang/',
+        'rent': 'https://{city}.58.com/zufang/'
     },
     '贝壳找房': {
         '新房': 'https://{city}.fang.ke.com/loupan/pg{page}/',
@@ -90,10 +124,13 @@ class MultiPlatformHousingScraper:
         if not os.path.exists(self.data_dir):
             os.makedirs(self.data_dir)
         
-        # 创建调试目录
+        # 设置输出目录
+        self.output_dir = 'output_data'
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+        
+        # 调试目录（已禁用保存）
         self.debug_dir = 'debug_pages'
-        if not os.path.exists(self.debug_dir):
-            os.makedirs(self.debug_dir)
         
         # 存储搜索结果
         self.house_data = []
@@ -131,16 +168,150 @@ class MultiPlatformHousingScraper:
         self.headers['User-Agent'] = self.ua.random
         return self.headers
     
-    def check_verification(self, response_text):
+    def check_verification(self, response_text, platform=None, url=None):
         """检查页面是否需要验证
         
         参数:
             response_text: 页面响应文本
+            platform: 平台名称（可选）
+            url: 请求的URL（可选）
             
         返回:
             bool: 是否需要验证
         """
-        # 基本验证词汇
+        # 如果提供了URL，尝试从URL中推断平台
+        if not platform and url:
+            if "anjuke.com" in url:
+                platform = "anjuke"
+            elif "58.com" in url:
+                platform = "58"
+            elif "ke.com" in url or "beike" in url:
+                platform = "beike"
+            elif "lianjia.com" in url:
+                platform = "lianjia"
+        
+        # 平台特定的验证检测
+        if platform:
+            if platform == "anjuke":
+                # 安居客特定的验证检测
+                anjuke_verification_keywords = [
+                    "verify.anjuke.com", "安居客验证", "滑动完成拼图", "拖动滑块",
+                    "请完成安全验证", "智能检测", "人机识别", "verify-slider"
+                ]
+                
+                # 检测明确的验证页面URL和元素
+                if "verify.anjuke.com" in response_text or "captcha-app" in response_text:
+                    logger.info(f"检测到安居客验证页面URL")
+                    return True
+                
+                # 更谨慎地检测关键词，至少需要两个关键词同时出现
+                keyword_count = 0
+                for keyword in anjuke_verification_keywords:
+                    if keyword in response_text:
+                        keyword_count += 1
+                        logger.debug(f"检测到安居客验证关键词: {keyword}")
+                
+                if keyword_count >= 2:
+                    logger.info(f"检测到多个安居客验证关键词: {keyword_count}个")
+                    return True
+                
+                # 检查响应长度并查找正常页面元素的存在性
+                if len(response_text) < 3000 and "anjuke.com" in response_text:
+                    # 确保页面上有房源特征元素
+                    normal_elements = [
+                        "list-item", "houselist-item", "house-details", "item-mod",
+                        "property-content", "property-info", "anjuke-logo", "房源信息", 
+                        "property-item", "key-list"
+                    ]
+                    
+                    found_elements = 0
+                    for element in normal_elements:
+                        if element in response_text:
+                            found_elements += 1
+                    
+                    # 如果正常页面元素很少，可能是验证页面
+                    if found_elements <= 2:
+                        logger.warning(f"安居客页面缺少正常房源元素({found_elements}/{len(normal_elements)})，可能是验证页面")
+                        
+                        # 额外检查，验证页面通常包含的元素
+                        verification_specific = ["验证", "captcha", "滑动", "拖动", "安全检测"]
+                        for element in verification_specific:
+                            if element in response_text:
+                                logger.warning(f"安居客页面包含验证特征元素: {element}")
+                                return True
+                    else:
+                        logger.info(f"安居客页面包含 {found_elements} 个正常元素，可能不是验证页面")
+                
+                return False
+            
+            elif platform == "58":
+                # 58同城特定的验证检测
+                tc58_verification_keywords = [
+                    "callback.58.com/antibot", "validate.58.com", "安全认证",
+                    "滑动验证", "请完成验证", "安全检测", "captcha.58.com"
+                ]
+                
+                for keyword in tc58_verification_keywords:
+                    if keyword in response_text:
+                        logger.info(f"检测到58同城验证关键词: {keyword}")
+                        return True
+                
+                # 检查58同城特有的验证页面特征
+                if "antirobot" in response_text or "security-verification" in response_text:
+                    logger.warning("58同城页面包含验证元素")
+                    return True
+                    
+                return False
+            
+            elif platform == "beike" or platform == "lianjia":
+                # 贝壳找房/链家特定的验证检测
+                beike_verification_keywords = [
+                    "captcha.lianjia", "verify.ke.com", "滑动验证", "拖动滑块",
+                    "security-check", "human-verify", "验证中心", "人机验证",
+                    "本次访问已触发人机验证", "请按指示操作", "CAPTCHA"
+                ]
+                
+                # 检测明确的验证页面
+                if "captcha.lianjia" in response_text or "verify.ke.com" in response_text:
+                    logger.info(f"检测到链家/贝壳验证页面URL")
+                    return True
+                
+                # 检测关键词
+                for keyword in beike_verification_keywords:
+                    if keyword in response_text:
+                        logger.info(f"检测到链家/贝壳验证关键词: {keyword}")
+                        return True
+                
+                # 检查页面内容长度和特征
+                if len(response_text) < 5000 and ("ke.com" in response_text or "lianjia.com" in response_text):
+                    # 链家/贝壳的验证页面通常非常短，并且缺少正常页面元素
+                    normal_elements = ["ershoufang", "loupan", "zufang", "sellListContent", 
+                                       "house-lst", "resblock-list", "resblock-name", "price"]
+                    
+                    found_elements = 0
+                    for element in normal_elements:
+                        if element in response_text:
+                            found_elements += 1
+                    
+                    # 如果找不到足够多的正常元素，可能是验证页面
+                    if found_elements <= 1:
+                        # 额外验证：验证页面通常包含这些元素
+                        captcha_elements = ["验证", "captcha", "verify", "人机", "滑动", "滑块"]
+                        for element in captcha_elements:
+                            if element in response_text:
+                                logger.warning(f"链家/贝壳页面缺少正常元素且包含验证元素: {element}")
+                                return True
+                        
+                        logger.warning(f"链家/贝壳页面内容异常简短且缺少正常元素")
+                        if "<!DOCTYPE html>" in response_text and len(response_text.strip()) < 1000:
+                            logger.warning("链家/贝壳页面可能是空白验证页面")
+                            return True
+                    else:
+                        logger.info(f"链家/贝壳页面包含{found_elements}个正常元素，可能不是验证页面")
+                
+                return False
+        
+        # 通用验证词汇（所有平台都适用）
         verification_keywords = [
             "验证码", "人机验证", "安全验证", "滑动验证", "captcha", "verify", 
             "verification", "security check", "人机识别", "拖动滑块", "拼图",
@@ -204,1534 +375,469 @@ class MultiPlatformHousingScraper:
         
         return False
     
-    def handle_verification(self, url):
-        """处理需要验证的情况，打开浏览器让用户验证或尝试自动验证"""
-        max_attempts = 3
+    def handle_verification(self, platform=None, url=None):
+        """处理验证码
         
+        参数:
+            platform: 平台名称，如"anjuke", "58"等
+            url: 需要验证的URL
+            
+        返回:
+            bool: 验证是否成功
+        """
+        if not url and platform:
+            # 如果提供了平台但没有URL，尝试构造一个测试URL
+            platforms_urls = {
+                "anjuke": "https://www.anjuke.com/",
+                "58": "https://www.58.com/",
+                "beike": "https://www.ke.com/",
+                "lianjia": "https://www.lianjia.com/"
+            }
+            url = platforms_urls.get(platform, "")
+            
+        if not url:
+            logger.error("无法处理验证，未提供URL")
+            return False
+        
+        # 确定平台类型，如果未提供
+        if not platform:
+            if "anjuke.com" in url:
+                platform = "anjuke"
+                logger.info("检测到安居客验证页面")
+            elif "58.com" in url:
+                platform = "58"
+                logger.info("检测到58同城验证页面")
+            elif "ke.com" in url or "beike" in url:
+                platform = "beike"
+                logger.info("检测到贝壳找房验证页面")
+            elif "lianjia.com" in url:
+                platform = "lianjia"
+                logger.info("检测到链家验证页面")
+        
+        max_attempts = 2  # 增加到2次尝试
+            
         # 如果启用了自动验证，尝试自动处理
         if self.auto_verification_handler:
             for attempt in range(max_attempts):
                 logger.info(f"检测到网站需要人机验证，尝试自动验证 (尝试 {attempt+1}/{max_attempts})...")
                 
-                verification_success = self.auto_verification_handler.handle_verification(url)
+                # 传递平台信息给验证处理器
+                verification_success = False
+                
+                if platform == "anjuke":
+                    # 安居客验证通常是滑块，需要特殊处理
+                    verification_success = self.auto_verification_handler.handle_verification(url, platform)
+                    logger.info("正在使用专门的安居客验证处理")
+                elif platform == "58":
+                    # 58同城验证通常是点选或滑块
+                    verification_success = self.auto_verification_handler.handle_verification(url, platform)
+                    logger.info("正在使用专门的58同城验证处理")
+                elif platform in ["beike", "lianjia"]:
+                    # 贝壳/链家验证通常是滑块
+                    verification_success = self.auto_verification_handler.handle_verification(url, platform)
+                    logger.info("正在使用专门的贝壳/链家验证处理")
+                else:
+                    # 其他平台使用通用验证处理
+                    verification_success = self.auto_verification_handler.handle_verification(url, platform)
                 
                 if verification_success:
-                    logger.info("自动验证成功")
+                    logger.info(f"{platform if platform else '未知平台'}自动验证成功")
                     
                     # 使用验证成功后的cookies更新请求头
                     cookies_dict = self.auto_verification_handler.get_cookies_dict()
                     if cookies_dict:
+                        # 保存完整的cookies信息而不是只取部分
                         cookies_str = '; '.join([f"{k}={v}" for k, v in cookies_dict.items()])
                         self.headers.update({'Cookie': cookies_str})
-                        logger.info(f"已更新Cookie: {cookies_str[:50]}...")
+                        logger.info(f"已更新Cookie: {len(cookies_dict)}个cookie值")
+                        
+                        # 更新User-Agent，匹配浏览器环境
+                        browser_ua = self.auto_verification_handler.driver.execute_script("return navigator.userAgent")
+                        if browser_ua:
+                            self.headers['User-Agent'] = browser_ua
+                            logger.info(f"已同步浏览器User-Agent: {browser_ua[:30]}...")
                     
-                    # 给验证一些生效的时间
-                    time.sleep(3)
+                    # 增加验证成功后的等待时间，从3秒增加到10秒
+                    logger.info("验证成功，等待10秒确保验证生效...")
+                    time.sleep(10)
+                    
+                    # 额外验证，确保cookies已正确保存
+                    test_response = None
+                    try:
+                        test_response = requests.get(url, headers=self.headers, timeout=10)
+                        if self.check_verification(test_response.text, platform, url):
+                            logger.warning("验证后仍然需要验证，尝试重新验证或使用不同方法")
+                            # 重置cookie并尝试下一次验证
+                            self.headers.pop('Cookie', None)
+                            time.sleep(2)
+                            continue
+                        else:
+                            logger.info("验证后访问成功，没有再次出现验证页面")
+                            return True
+                    except Exception as e:
+                        logger.error(f"验证后测试访问失败: {e}")
+                        # 继续返回真，因为验证过程本身是成功的
+                    
                     return True
                 else:
                     logger.warning(f"自动验证尝试 {attempt+1} 失败")
                     time.sleep(2)  # 等待一下再尝试
         
-        # 如果自动验证失败或未启用，回退到手动验证或跳过
-        logger.info(f"检测到网站需要人机验证，将打开浏览器供您手动验证或选择跳过")
-        print(f"\n[!] 请选择操作:")
+        # 如果自动验证失败或未启用，提供更具体的平台验证说明
+        platform_name = {
+            "anjuke": "安居客",
+            "58": "58同城", 
+            "beike": "贝壳找房",
+            "lianjia": "链家"
+        }.get(platform, "该网站")
+        
+        logger.info(f"检测到{platform_name}需要人机验证，将打开浏览器供您手动验证或选择跳过")
+        print(f"\n[!] {platform_name}需要人机验证，请选择操作:")
         print(f"  1. 在浏览器中完成验证后回到控制台继续")
         print(f"  2. 跳过当前页面的验证，继续爬取下一页/下一平台")
+        
+        # 提供平台特定的验证提示
+        if platform == "anjuke":
+            print(f"  【安居客验证提示】通常是滑块拼图验证，拖动滑块完成拼图即可")
+        elif platform == "58":
+            print(f"  【58同城验证提示】可能是点选验证或滑块验证，按页面提示完成")
+        elif platform in ["beike", "lianjia"]:
+            print(f"  【贝壳/链家验证提示】通常是滑块验证，拖动滑块到指定位置")
+        
         choice = input("请输入选项 (1/2): ").strip()
         
         if choice == '2':
-            print("已选择跳过验证，继续爬取下一页/下一平台...")
+            print(f"已选择跳过{platform_name}验证，继续爬取下一页/下一平台...")
             return False
         
         # 打开浏览器
         try:
+            import webbrowser
             webbrowser.open(url)
             
             # 等待用户验证
-            input("\n按回车键继续爬取 (完成验证后)...")
+            input(f"\n在浏览器中完成{platform_name}验证后，按回车键继续爬取...")
             print("继续爬取过程...")
             
-            # 给一些延迟以确保验证会话有效
-            time.sleep(3)
+            # 给一些延迟以确保验证会话有效，手动验证后也增加等待时间
+            time.sleep(8)
             
             return True
         except Exception as e:
             logger.error(f"打开浏览器失败: {e}")
-            print("\n[!] 无法自动打开浏览器，请手动访问以下链接并完成验证:")
+            print(f"\n[!] 无法自动打开浏览器，请手动访问以下链接并完成{platform_name}验证:")
             print(f"    {url}")
             input("\n按回车键继续爬取 (完成验证后)...")
-            time.sleep(3)
+            time.sleep(8)
             return True
     
-    def detect_house_item_selector(self, soup, site='anjuke', house_type='新房'):
-        """
-        自动检测房源列表项的选择器
+    def scrape_anjuke(self, city, house_type, bedroom_num, livingroom_num, build_year, page_count):
+        # 实现安居客爬取逻辑
+        pass
+    
+    def scrape_58(self, city, house_type, bedroom_num, livingroom_num, build_year, page_count):
+        """爬取58同城房源数据
         
         参数:
-            soup: BeautifulSoup对象
-            site: 网站名称
-            house_type: 房源类型
+            city: 城市代码，如'bj'
+            house_type: 房源类型，如'new'(新房),'second'(二手房),'rent'(租房)
+            bedroom_num: 卧室数量筛选，None表示不限
+            livingroom_num: 客厅数量筛选，None表示不限
+            build_year: 建筑年份筛选，None表示不限
+            page_count: 爬取页数
             
         返回:
-            选择器字符串
+            bool: 是否爬取成功
         """
-        # 安居客新房可能的选择器
-        anjuke_new_house_selectors = [
-            '.item-mod', '.key-list .item', '.anjuke-result-box .anjuke-result-item',
-            '.property-item', '.loupan-item', '.building-item', '.house-item', 
-            '.card', '.result-item', '[id*="loupan"] .item', '.new-house-item',
-            '.items-list .item', '.list-content > div', '.list > li', '.item', 
-            '[data-list-index]', '.list-cell', '.list-item'
-        ]
+        print(f"开始爬取58同城-{house_type}，城市: {city}")
+        logger.info(f"开始爬取58同城-{house_type}，城市: {city}")
         
-        # 安居客二手房可能的选择器
-        anjuke_used_house_selectors = [
-            '.list-item', '.houselist-item', '.house-cell', '.houseCard', 
-            '.house-item', '.property-item', '.sale-item', '.list-content > div',
-            '.list > li', '.house-details', '[data-list-index]', 'div[data-component="item"]',
-            '.list-cell', '.items-list .item', '.item'
-        ]
-        
-        # 58同城新房可能的选择器
-        tc58_new_house_selectors = [
-            '.key-list .item', '.house-list-item', '.build-list-item',
-            '.list > li', '.loupan-list > li', '.newhouse-item', '.list-cell', 
-            '.list-item', '[class*="list"] > [class*="item"]'
-        ]
-        
-        # 58同城二手房可能的选择器
-        tc58_used_house_selectors = [
-            '.house-cell', '.house-cell-list > li', '.house-item', 
-            '.ershou-item', '.list > li', '.house-list-item', '.list-cell',
-            '.property-item', '.item'
-        ]
-        
-        # 贝壳找房新房可能的选择器
-        beike_new_house_selectors = [
-            '.resblock-list-wrapper > li', '.resblock-list-container .resblock-list',
-            '.resblock-item', '.loupan-item', '.new-house-item', '.house-item',
-            '.key-list > .item', '.item'
-        ]
-        
-        # 贝壳找房二手房可能的选择器
-        beike_used_house_selectors = [
-            '.sellListContent > li', '.VIEWLIST', '.house-item',
-            '.item-card', '.ershoufang-item', '.house-cell', '.key-list > .item',
-            '.item'
-        ]
-        
-        # 链家新房可能的选择器
-        lianjia_new_house_selectors = [
-            '.resblock-list-container .resblock-list', '.resblock-list-module',
-            '.newhouse-list .house-item', '.house-cell', '.loupan-item',
-            '.key-list > .item', '.item'
-        ]
-        
-        # 链家二手房可能的选择器
-        lianjia_used_house_selectors = [
-            '.sellListContent > li', '.main-house-list .item', '.house-item',
-            '.list-item', '.ershoufang-item', '.key-list > .item', '.item'
-        ]
-        
-        # 根据网站和房源类型选择可能的选择器列表
-        selectors = []
-        if site == 'anjuke':
-            if house_type == '新房':
-                selectors = anjuke_new_house_selectors
-            else:
-                selectors = anjuke_used_house_selectors
-        elif site == '58':
-            if house_type == '新房':
-                selectors = tc58_new_house_selectors
-            else:
-                selectors = tc58_used_house_selectors
-        elif site == 'beike':
-            if house_type == '新房':
-                selectors = beike_new_house_selectors
-            else:
-                selectors = beike_used_house_selectors
-        elif site == 'lianjia':
-            if house_type == '新房':
-                selectors = lianjia_new_house_selectors
-            else:
-                selectors = lianjia_used_house_selectors
-        
-        # 测试每个选择器，返回匹配项数量最多的选择器
-        max_items = 0
-        best_selector = None
-        
-        for selector in selectors:
-            items = soup.select(selector)
-            if len(items) > max_items:
-                max_items = len(items)
-                best_selector = selector
-                
-                # 如果找到的项目数量超过5个，认为这是有效的选择器
-                if max_items >= 5:
-                    logger.info(f"使用选择器 '{selector}' 找到 {max_items} 个房源项")
-                    return selector
-        
-        # 如果没有找到满意的选择器，返回匹配项最多的那个
-        if best_selector and max_items > 0:
-            logger.info(f"使用选择器 '{best_selector}' 找到 {max_items} 个房源项")
-            return best_selector
-        
-        # 尝试更通用的选择器，如果上面的都没有找到结果
-        general_selectors = [
-            '.list-content > div', '.list > li', '.items-list > div', 
-            '[class*="list"] > [class*="item"]', 'div[data-index]', 'div[data-list-index]', 
-            'div[data-id]', '.content > div', '.content > li'
-        ]
-        
-        for selector in general_selectors:
-            items = soup.select(selector)
-            if len(items) > max_items:
-                max_items = len(items)
-                best_selector = selector
-                
-                if max_items >= 3:  # 降低标准，只要找到3个以上即可
-                    logger.info(f"使用通用选择器 '{selector}' 找到 {max_items} 个房源项")
-                    return selector
-        
-        # 如果general_selectors中有找到结果但不多于3个，也返回最好的那个
-        if best_selector and max_items > 0:
-            logger.info(f"使用通用选择器 '{best_selector}' 找到 {max_items} 个房源项")
-            return best_selector
+        # 检查筛选条件
+        filter_conditions = []
+        if bedroom_num is not None:
+            filter_conditions.append(f"卧室数: {bedroom_num}")
+        if livingroom_num is not None:
+            filter_conditions.append(f"客厅数: {livingroom_num}")
+        if build_year is not None:
+            filter_conditions.append(f"建筑年份: {build_year}")
             
-        # 如果实在找不到任何有效选择器，返回最通用的选择器
-        logger.warning("无法找到合适的选择器，使用最通用选择器")
-        return 'div, li, .item, .cell'
+        if filter_conditions:
+            logger.info(f"筛选条件: {', '.join(filter_conditions)}")
         
-    def save_debug_page(self, response_text, site, house_type, page):
-        """保存页面用于调试"""
-        debug_file = os.path.join(self.debug_dir, f"{site}_{house_type}_p{page}.html")
+        # 当前平台和类型的URL模板
+        url_template = URL_TEMPLATES['58同城'][house_type]
+        base_url = url_template.format(city=city)
+        
+        total_items = 0
+        
         try:
-            with open(debug_file, 'w', encoding='utf-8') as f:
-                f.write(response_text)
-            logger.info(f"已保存调试页面: {debug_file}")
-        except Exception as e:
-            logger.error(f"保存调试页面失败: {e}")
-    
-    def scrape_anjuke(self, city, house_type, bedroom_num=None, livingroom_num=None, build_year=None, page_count=3):
-        """
-        爬取安居客房源数据
-        
-        参数:
-            city: 城市名称
-            house_type: 房源类型 (新房/二手房/租房)
-            bedroom_num: 卧室数量
-            livingroom_num: 客厅数量
-            build_year: 建筑年份
-            page_count: 爬取页数
-        """
-        logger.info(f"开始爬取安居客{city}{house_type}数据")
-        if bedroom_num or livingroom_num:
-            logger.info(f"筛选条件: {bedroom_num}室{livingroom_num}厅")
-        if build_year:
-            logger.info(f"建筑年份: {build_year}年")
-            
-        # 构建URL - 使用城市代码
-        city_code = CITY_CODES.get(city, city)  # 获取城市代码，如果没有则使用原始输入
-        
-        # 获取URL模板
-        url_template = URL_TEMPLATES['安居客'][house_type]
-        
-        total_items = 0
-        verification_handled = False
-        max_retries = 3  # 每页最大重试次数
-        
-        for page in range(1, page_count + 1):
-            url = url_template.format(city=city_code, page=page)
-            headers = self.update_headers()
-            
-            retry_count = 0
-            while retry_count < max_retries:
+            # 爬取指定页数
+            for page in range(1, page_count + 1):
+                if page > 1:
+                    # 构建翻页URL
+                    if house_type == 'new':
+                        # 新房翻页规则
+                        page_url = f"{base_url}pn{page}/"
+                    elif house_type == 'second':
+                        # 二手房翻页规则 
+                        page_url = f"{base_url}pn{page}/"
+                    else:  # 租房
+                        page_url = f"{base_url}pn{page}/"
+                else:
+                    page_url = base_url
+                
+                logger.info(f"爬取页面: {page}/{page_count}, URL: {page_url}")
+                
+                # 发送请求
+                headers = self.update_headers()
                 try:
-                    logger.info(f"正在爬取第{page}页: {url}")
-                    response = requests.get(url, headers=headers, timeout=10)
-                    
-                    # 检查是否需要验证
-                    if self.check_verification(response.text):
-                        logger.warning("检测到安居客需要人机验证")
-                        
-                        if not verification_handled:
-                            verification_handled = self.handle_verification(url)
-                            # 如果用户选择跳过验证，继续下一页
-                            if not verification_handled:
-                                logger.warning("用户选择跳过验证，继续下一页")
-                                break
-                            # 重新请求当前页
-                            response = requests.get(url, headers=headers, timeout=10)
-                        else:
-                            logger.warning("仍然需要验证，可能验证未成功")
-                            # 保存页面用于分析
-                            self.save_debug_page(response.text, "anjuke", house_type, page)
-                            retry_count += 1
-                            time.sleep(self.get_random_delay() * 2)  # 增加等待时间
-                            continue
-                    
-                    if response.status_code == 200:
-                        soup = BeautifulSoup(response.text, 'html.parser')
-                        
-                        # 检查页面是否有内容
-                        if len(soup.text) < 1000:  # 页面内容过少，可能是反爬页面
-                            logger.warning(f"页面内容过少，可能是反爬页面")
-                            
-                            if not verification_handled:
-                                verification_handled = self.handle_verification(url)
-                                # 重新请求当前页
-                                response = requests.get(url, headers=headers, timeout=10)
-                                soup = BeautifulSoup(response.text, 'html.parser')
-                            else:
-                                logger.warning("仍然无法获取完整页面，重试")
-                                self.save_debug_page(response.text, "anjuke", house_type, page)
-                                retry_count += 1
-                                time.sleep(self.get_random_delay() * 2)
-                                continue
-                        
-                        # 自动检测房源项选择器
-                        item_selector = self.detect_house_item_selector(soup, 'anjuke', house_type)
-                        
-                        house_items = soup.select(item_selector)
-                        
-                        if not house_items:
-                            logger.warning(f"未找到房源数据，尝试其他选择器")
-                            self.save_debug_page(response.text, "anjuke", house_type, page)
-                            retry_count += 1
-                            continue
-                        
-                        logger.info(f"成功找到 {len(house_items)} 个房源项")
-                                
-                        for item in house_items:
-                            try:
-                                # 获取房源名称 - 使用多个选择器
-                                name = None
-                                for name_selector in ['.items-name', '.loupan-name', '.title', 'h3', '.name', '.building-name', '[class*="name"]', 'a', '.info', '.info-title', '.house-title']:
-                                    name_elem = item.select_one(name_selector)
-                                    if name_elem:
-                                        name = name_elem.text.strip()
-                                        break
-                                
-                                # 如果仍未找到名称，尝试从链接文本中提取
-                                if name is None:
-                                    links = item.select('a')
-                                    for link in links:
-                                        if link.text and len(link.text.strip()) > 5:  # 长度超过5的可能是标题
-                                            name = link.text.strip()
-                                            break
-                                
-                                if name is None:
-                                    name = "未知"
-                                
-                                # 获取房源价格 - 使用多个选择器
-                                price_text = "未知"
-                                for price_selector in ['.price', '.money', '.total-price', '.average', '.unit-price', '[class*="price"]', '.value', '.price-det', '.num']:
-                                    price_elem = item.select_one(price_selector)
-                                    if price_elem:
-                                        price_text = price_elem.text.strip()
-                                        break
-                                
-                                # 确保价格中只包含数字和单位
-                                if price_text != "未知":
-                                    # 清理常见价格文本格式
-                                    price_text = re.sub(r'\s+', '', price_text)  # 移除空白字符
-                                    
-                                    # 尝试使用正则提取数字部分和单位
-                                    price_match = re.search(r'([\d\.]+)([万元/平元/㎡]*)', price_text)
-                                    if price_match:
-                                        price_value = price_match.group(1)
-                                        price_unit = price_match.group(2) if price_match.group(2) else "元/平"
-                                        price_text = f"{price_value}{price_unit}"
-                                
-                                # 获取房源位置 - 使用多个选择器
-                                location = "未知"
-                                for loc_selector in ['.address', '.loc', '.location', '.position', '[class*="address"]', '[class*="location"]', '.address-text', '.region', '.area-text']:
-                                    loc_elem = item.select_one(loc_selector)
-                                    if loc_elem:
-                                        location = loc_elem.text.strip()
-                                        break
-                                
-                                # 如果位置信息为空但有区域信息，使用区域信息
-                                if location == "未知":
-                                    for region_selector in ['.region', '.area', '.district', '[class*="region"]', '[class*="district"]']:
-                                        region_elem = item.select_one(region_selector)
-                                        if region_elem:
-                                            location = region_elem.text.strip()
-                                            break
-                                
-                                # 如果还是未知，从整个元素文本中尝试提取位置信息
-                                if location == "未知":
-                                    # 常见城市区域名称模式
-                                    location_pattern = r'([东西南北中]部|[东西南北]\d+|[a-zA-Z0-9]+区|.{2,4}路|[a-zA-Z0-9]+街道|.{2,4}小区)'
-                                    location_match = re.search(location_pattern, item.text)
-                                    if location_match:
-                                        location = location_match.group(0)
-                                
-                                # 获取房屋户型 - 使用多个选择器
-                                house_type_text = "未知"
-                                for type_selector in ['.house-type', '.huxing', '.type', '.rooms', '[class*="type"]', '[class*="huxing"]', '.layout', '.room', '.house-txt']:
-                                    type_elem = item.select_one(type_selector)
-                                    if type_elem:
-                                        house_type_text = type_elem.text.strip()
-                                        break
-                                
-                                # 如果户型信息不包含"室"，可能不是户型信息
-                                if house_type_text != "未知" and "室" not in house_type_text:
-                                    # 在房源元素的完整文本中搜索户型信息
-                                    house_type_match = re.search(r'(\d+)\s*室\s*(\d+)\s*厅', item.text)
-                                    if house_type_match:
-                                        rooms, livingrooms = house_type_match.group(1), house_type_match.group(2)
-                                        house_type_text = f"{rooms}室{livingrooms}厅"
-                                    else:
-                                        house_type_text = "未知"
-                                
-                                # 如果户型仍然未知，尝试更广泛的匹配
-                                if house_type_text == "未知":
-                                    # 搜索任何可能的户型信息
-                                    house_pattern = r'(\d+)[室].*?(\d+)[厅厘]'
-                                    house_match = re.search(house_pattern, item.text)
-                                    if house_match:
-                                        house_type_text = f"{house_match.group(1)}室{house_match.group(2)}厅"
-                                
-                                # 如果需要筛选几室几厅
-                                if bedroom_num or livingroom_num:
-                                    # 在整个房源项元素的文本中查找户型信息
-                                    room_match = re.search(r'(\d+)\s*室\s*(\d+)\s*厅', item.text)
-                                    if room_match:
-                                        rooms, livingrooms = int(room_match.group(1)), int(room_match.group(2))
-                                        if (bedroom_num and rooms != bedroom_num) or (livingroom_num and livingrooms != livingroom_num):
-                                            continue  # 如果不符合筛选条件，跳过当前房源
-                                        house_type_text = f"{rooms}室{livingrooms}厅"
-                                    else:
-                                        # 没找到户型信息，但有筛选条件，则跳过
-                                        if bedroom_num or livingroom_num:
-                                            continue
-                                
-                                # 获取建筑面积 - 使用多个选择器
-                                area_text = "未知"
-                                for area_selector in ['.area', '.square', '.size', '[class*="area"]', '[class*="square"]', '.house-area', '.area-num']:
-                                    area_elem = item.select_one(area_selector)
-                                    if area_elem:
-                                        area_text = area_elem.text.strip()
-                                        break
-                                
-                                # 从文本中提取数字作为面积
-                                area = "未知"
-                                # 先尝试从area_text中提取
-                                if area_text != "未知":
-                                    area_match = re.search(r'(\d+\.?\d*)\s*[平㎡]', area_text)
-                                    if area_match:
-                                        area = area_match.group(1)
-                                
-                                # 如果从area_text中没提取到，尝试从整个元素文本中提取
-                                if area == "未知":
-                                    area_match = re.search(r'(\d+\.?\d*)\s*[平㎡平米平方米]', item.text)
-                                    if area_match:
-                                        area = area_match.group(1)
-                                
-                                # 获取建筑年份（如果有的话）
-                                build_year_found = "未知"
-                                # 先通过选择器尝试查找
-                                for year_selector in ['.year', '.time', '[class*="year"]', '[class*="build"]', '.tag']:
-                                    year_elem = item.select_one(year_selector)
-                                    if year_elem:
-                                        year_text = year_elem.text.strip()
-                                        year_match = re.search(r'(\d{4})\s*年', year_text)
-                                        if year_match:
-                                            build_year_found = year_match.group(1)
-                                            break
-                                
-                                # 如果选择器未找到，尝试从整个元素文本中提取
-                                if build_year_found == "未知":
-                                    year_match = re.search(r'(\d{4})\s*年[建筑建成]?', item.text)
-                                    if year_match:
-                                        build_year_found = year_match.group(1)
-                                
-                                # 如果指定了建筑年份筛选条件
-                                if build_year and build_year_found != "未知":
-                                    # 转换为整数进行比较
-                                    try:
-                                        if int(build_year_found) != int(build_year):
-                                            continue
-                                    except ValueError:
-                                        pass
-                                
-                                # 构建数据项
-                                house_data = {
-                                    '名称': name,
-                                    '价格': price_text,
-                                    '位置': location,
-                                    '户型': house_type_text,
-                                    '面积(平方米)': area,
-                                    '建筑年份': build_year_found,
-                                    '平台': '安居客',
-                                    '类型': house_type,
-                                    '爬取时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                }
-                                
-                                self.house_data.append(house_data)
-                                logger.info(f"已爬取: {name} - {price_text} - {house_type_text}")
-                                total_items += 1
-                                
-                            except Exception as e:
-                                logger.error(f"处理房源项时出错: {e}")
-                        
-                        # 爬取成功，跳出重试循环
-                        break
-                    
-                    else:
-                        logger.warning(f"请求失败，状态码: {response.status_code}")
-                        retry_count += 1
-                    
+                    response = requests.get(page_url, headers=headers, timeout=10)
                 except Exception as e:
-                    logger.error(f"爬取第{page}页时出错: {e}")
-                    retry_count += 1
-                
-                # 如果需要重试，等待更长时间
-                if retry_count < max_retries and retry_count > 0:
-                    wait_time = self.get_random_delay() * (retry_count + 1)
-                    logger.info(f"等待 {wait_time:.2f} 秒后重试...")
-                    time.sleep(wait_time)
-            
-            # 正常延迟到下一页
-            time.sleep(self.get_random_delay())
-        
-        logger.info(f"安居客爬取完成，共获取{total_items}条数据")
-        return self.house_data
-    
-    def scrape_58(self, city, house_type, bedroom_num=None, livingroom_num=None, build_year=None, page_count=3):
-        """
-        爬取58同城房源数据
-        
-        参数:
-            city: 城市名称
-            house_type: 房源类型 (新房/二手房/租房)
-            bedroom_num: 卧室数量
-            livingroom_num: 客厅数量
-            build_year: 建筑年份
-            page_count: 爬取页数
-        """
-        print(f"开始爬取58同城{city}{house_type}数据")
-        if bedroom_num or livingroom_num:
-            print(f"筛选条件: {bedroom_num}室{livingroom_num}厅")
-        if build_year:
-            print(f"建筑年份: {build_year}年")
-        
-        # 构建URL - 使用城市代码而不是直接使用中文名
-        city_abbr = city  # 城市代码，例如郑州为zz
-        if house_type == '新房':
-            base_url = f"https://{city_abbr}.58.com/loupan/all/p{{}}"
-        elif house_type == '二手房':
-            base_url = f"https://{city_abbr}.58.com/ershoufang/p{{}}"
-        else:  # 租房
-            base_url = f"https://{city_abbr}.58.com/zufang/p{{}}"
-        
-        total_items = 0
-        verification_handled = False
-        
-        for page in range(1, page_count + 1):
-            url = base_url.format(page)
-            headers = self.update_headers()
-            
-            try:
-                print(f"正在爬取第{page}页: {url}")
-                response = requests.get(url, headers=headers, timeout=10)
+                    logger.error(f"请求页面失败: {e}")
+                    continue
                 
                 # 检查是否需要验证
-                if self.check_verification(response.text):
-                    if not verification_handled:
-                        verification_handled = self.handle_verification(url)
-                        # 如果用户选择跳过验证，继续下一页
-                        if not verification_handled:
-                            print("用户选择跳过验证，继续下一页")
-                            break
-                        # 重新请求当前页
-                        response = requests.get(url, headers=headers, timeout=10)
-                    else:
-                        print("仍然需要验证，可能验证未成功，跳过当前页")
+                if self.check_verification(response.text, "58", page_url):
+                    logger.warning("检测到需要验证")
+                    verify_success = self.handle_verification("58", page_url)
+                    if not verify_success:
+                        logger.warning("验证失败或用户选择跳过，继续下一页")
+                        continue
+                    
+                    # 验证成功后重新请求页面
+                    try:
+                        headers = self.update_headers()
+                        response = requests.get(page_url, headers=headers, timeout=10)
+                    except Exception as e:
+                        logger.error(f"验证后重新请求页面失败: {e}")
                         continue
                 
-                if response.status_code == 200:
-                    soup = BeautifulSoup(response.text, 'html.parser')
+                # 解析HTML
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # 根据房源类型选择不同的选择器
+                if house_type == 'new':
+                    # 新房选择器
+                    items = soup.select('.list-item')
+                    logger.info(f"找到 {len(items)} 个新房项目")
                     
-                    # 根据房源类型选择不同的选择器
-                    if house_type == '新房':
-                        house_items = soup.select('.key-list .item')
-                        if not house_items:
-                            print("未找到房源数据，尝试其他选择器")
-                            house_items = soup.select('.property')  # 尝试新的选择器
-                            if not house_items:
-                                house_items = soup.select('.item')  # 再次尝试更通用的选择器
-                            if not house_items:
-                                print("所有选择器均未找到数据，可能需要更新")
-                                continue
-                        
-                        print(f"成功找到 {len(house_items)} 个房源项")
-                        
-                        for item in house_items:
-                            try:
-                                # 获取房源名称
-                                name = item.select_one('.lp-name').text.strip() if item.select_one('.lp-name') else "未知"
-                                
-                                # 获取房源价格
-                                price_text = item.select_one('.price').text.strip() if item.select_one('.price') else "未知"
-                                
-                                # 获取房源地址
-                                location = item.select_one('.address').text.strip() if item.select_one('.address') else "未知"
-                                
-                                # 获取房屋类型
-                                house_type_text = ""
-                                for tag in item.select('.tag-panel span'):
-                                    text = tag.text.strip()
-                                    if "室" in text and "厅" in text:
-                                        house_type_text = text
-                                        break
-                                
-                                # 获取建筑年份
-                                year = "未知"
-                                for tag in item.select('.tag-panel span'):
-                                    year_match = re.search(r'(\d{4})年', tag.text)
-                                    if year_match:
-                                        year = year_match.group(1)
-                                        break
-                                
-                                # 如果指定了建筑年份筛选条件，检查是否符合
-                                if build_year and year != "未知":
-                                    if int(year) != int(build_year):
-                                        continue
-                                
-                                # 如果需要筛选几室几厅
-                                if bedroom_num or livingroom_num:
-                                    room_match = re.search(r'(\d+)室(\d+)厅', house_type_text)
-                                    if room_match:
-                                        rooms, livingrooms = int(room_match.group(1)), int(room_match.group(2))
-                                        if (bedroom_num and rooms != bedroom_num) or (livingroom_num and livingrooms != livingroom_num):
-                                            continue
-                                
-                                # 获取面积
-                                area_text = ""
-                                for tag in item.select('.tag-panel span'):
-                                    area_match = re.search(r'(\d+\.?\d*)平米', tag.text)
-                                    if area_match:
-                                        area_text = area_match.group(0)
-                                        break
-                                
-                                # 构建数据项
-                                house_data = {
-                                    '平台': '58同城',
-                                    '名称': name,
-                                    '价格': price_text,
-                                    '位置': location,
-                                    '户型': house_type_text,
-                                    '面积': area_text,
-                                    '建筑年份': year,
-                                    '房源类型': house_type,
-                                    '城市': city,
-                                    '爬取时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                }
-                                
-                                self.house_data.append(house_data)
-                                total_items += 1
-                                print(f"已爬取: {name} - {price_text} - {house_type_text}")
-                                
-                            except Exception as e:
-                                print(f"处理房源项时出错: {e}")
+                elif house_type == 'second':
+                    # 二手房选择器
+                    items = soup.select('.house-cell') or soup.select('.yezhu_item') or soup.select('.house-item')
+                    logger.info(f"找到 {len(items)} 个二手房项目")
                     
-                    elif house_type == '二手房':
-                        # 尝试多个可能的选择器
-                        house_items = soup.select('.property')
-                        if not house_items:
-                            print("未找到房源数据，尝试其他选择器")
-                            house_items = soup.select('.listItem')
-                            if not house_items:
-                                house_items = soup.select('li.house-cell')
-                                if not house_items:
-                                    house_items = soup.select('.house-item')
-                                    if not house_items:
-                                        print("所有选择器均未找到数据，可能需要更新")
-                                        continue
+                else:  # 租房
+                    # 租房选择器
+                    items = soup.select('.listCon > .listUl > li') or soup.select('.zu-itembox') or soup.select('.house-item')
+                    logger.info(f"找到 {len(items)} 个租房项目")
+                
+                # 处理每个房源项
+                for item in items:
+                    try:
+                        # 提取房源名称
+                        name_elem = item.select_one('.title a') or item.select_one('.title') or item.select_one('h3')
+                        house_name = name_elem.get_text(strip=True) if name_elem else "未知房源"
                         
-                        print(f"成功找到 {len(house_items)} 个房源项")
+                        # 提取价格
+                        price_elem = item.select_one('.price') or item.select_one('.money')
+                        price = price_elem.get_text(strip=True) if price_elem else "价格未知"
                         
-                        for item in house_items:
-                            try:
-                                # 尝试不同的选择器组合来获取数据
-                                # 获取房源标题
-                                title = None
-                                title_selectors = [
-                                    '.title a', '.title', 'h3', '.house-title', '.property-content-title h3'
-                                ]
-                                for selector in title_selectors:
-                                    title_elem = item.select_one(selector)
-                                    if title_elem:
-                                        title = title_elem.text.strip()
-                                        break
-                                
-                                if not title:
-                                    title = "未知"
-                                
-                                # 获取房源价格
-                                price = None
-                                price_selectors = [
-                                    '.price', '.money', '.price-det', '.total-price', '.property-price', '.price_total'
-                                ]
-                                for selector in price_selectors:
-                                    price_elem = item.select_one(selector)
-                                    if price_elem:
-                                        price = price_elem.text.strip()
-                                        break
-                                
-                                if not price:
-                                    price = "未知"
-                                
-                                # 获取房源地址
-                                address = None
-                                address_selectors = [
-                                    '.address', '.list-cell-address', '.positionInfo', '.property-content-info'
-                                ]
-                                for selector in address_selectors:
-                                    address_elem = item.select_one(selector)
-                                    if address_elem:
-                                        address = address_elem.text.strip()
-                                        break
-                                
-                                if not address:
-                                    address = "未知"
-                                
-                                # 获取房屋类型
-                                house_type_text = ""
-                                type_selectors = [
-                                    '.houseInfo', '.room', '.property-content-info .property-content-info-text'
-                                ]
-                                
-                                for selector in type_selectors:
-                                    type_elems = item.select(selector)
-                                    for elem in type_elems:
-                                        text = elem.text.strip()
-                                        if "室" in text and "厅" in text:
-                                            house_type_text = text
-                                            break
-                                    if house_type_text:
-                                        break
-                                
-                                # 如果还未找到户型信息，尝试从整个item文本中提取
-                                if not house_type_text:
-                                    item_text = item.text
-                                    room_match = re.search(r'(\d+)室(\d+)厅', item_text)
-                                    if room_match:
-                                        rooms, livingrooms = int(room_match.group(1)), int(room_match.group(2))
-                                        if (bedroom_num and rooms != bedroom_num) or (livingroom_num and livingrooms != livingroom_num):
-                                            continue
-                                
-                                # 获取面积
-                                area_text = "未知"
-                                area_match = re.search(r'(\d+\.?\d*)平米', item.text)
-                                if area_match:
-                                    area_text = area_match.group(0)
-                                
-                                # 构建数据项
-                                house_data = {
-                                    '平台': '58同城',
-                                    '名称': title,
-                                    '价格': price,
-                                    '位置': address,
-                                    '户型': house_type_text,
-                                    '面积': area_text,
-                                    '建筑年份': year,
-                                    '房源类型': house_type,
-                                    '城市': city,
-                                    '爬取时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                }
-                                
-                                self.house_data.append(house_data)
-                                total_items += 1
-                                print(f"已爬取: {title} - {price} - {house_type_text}")
-                                
-                            except Exception as e:
-                                print(f"处理房源项时出错: {e}")
-                    
-                    else:  # 租房
-                        house_items = soup.select('.list-cell')
-                        if not house_items:
-                            print("未找到房源数据，尝试其他选择器")
-                            house_items = soup.select('.property')
-                            if not house_items:
-                                house_items = soup.select('.card')
-                                if not house_items:
-                                    print("所有选择器均未找到数据，可能需要更新")
+                        # 提取地址/位置
+                        address_elem = (
+                            item.select_one('.address') or 
+                            item.select_one('.add') or 
+                            item.select_one('.area') or
+                            item.select_one('.district')
+                        )
+                        address = address_elem.get_text(strip=True) if address_elem else "位置未知"
+                        
+                        # 提取户型，确保初始化为默认值
+                        house_type_elem = (
+                            item.select_one('.type') or 
+                            item.select_one('.huxing') or
+                            item.select_one('.room')
+                        )
+                        house_type_text = house_type_elem.get_text(strip=True) if house_type_elem else "户型未知"
+                        
+                        # 提取面积
+                        area_elem = item.select_one('.area') or item.select_one('.meter')
+                        area = area_elem.get_text(strip=True) if area_elem else "面积未知"
+                        
+                        # 提取建筑年份 - 确保始终有初始值
+                        year = "未知"  
+                        
+                        info_list = item.select('.baseInfo li') or item.select('.info-tag span')
+                        for info in info_list:
+                            info_text = info.get_text(strip=True)
+                            if '年' in info_text:
+                                year_match = re.search(r'(\d{4})年', info_text)
+                                if year_match:
+                                    year = year_match.group(1)
+                                    break
+                        
+                        # 提取详情页链接
+                        link_elem = item.select_one('a[href]') or name_elem
+                        detail_url = ""
+                        if link_elem and link_elem.has_attr('href'):
+                            href = link_elem['href']
+                            if href.startswith('//'):
+                                detail_url = 'https:' + href
+                            elif href.startswith('/'):
+                                detail_url = f'https://{city}.58.com{href}'
+                            elif not href.startswith('http'):
+                                detail_url = f'https://{city}.58.com/{href}'
+                            else:
+                                detail_url = href
+                        
+                        # 提取经纬度
+                        lat, lng = self.extract_coordinates(item)
+                        
+                        # 提取户型图
+                        layout_image = ""
+                        try:
+                            layout_image = self.extract_layout_image(item, detail_url)
+                        except Exception as e:
+                            logger.error(f"提取户型图错误: {str(e)}")
+                            layout_image = ""
+                        
+                        # 筛选条件判断
+                        if bedroom_num is not None:
+                            bedroom_match = re.search(r'(\d+)室', house_type_text)
+                            if bedroom_match:
+                                if int(bedroom_match.group(1)) != bedroom_num:
+                                    logger.debug(f"跳过房源 - 不符合卧室数量要求: {house_type_text}")
                                     continue
-                                
-                        print(f"成功找到 {len(house_items)} 个房源项")
                         
-                        for item in house_items:
+                        if livingroom_num is not None:
+                            livingroom_match = re.search(r'(\d+)厅', house_type_text)
+                            if livingroom_match:
+                                if int(livingroom_match.group(1)) != livingroom_num:
+                                    logger.debug(f"跳过房源 - 不符合客厅数量要求: {house_type_text}")
+                                    continue
+                        
+                        # 确保year变量始终被定义
+                        if build_year is not None and year != "未知":
                             try:
-                                # 获取房源标题
-                                title = item.select_one('.list-cell-title a').text.strip() if item.select_one('.list-cell-title a') else "未知"
-                                
-                                # 获取房源价格
-                                price_elem = item.select_one('.money')
-                                price = price_elem.text.strip() + "元/月" if price_elem else "未知"
-                                
-                                # 获取房源地址
-                                address = item.select_one('.list-cell-address a span').text.strip() if item.select_one('.list-cell-address a span') else "未知"
-                                
-                                # 获取房屋类型
-                                house_type_text = ""
-                                for tag in item.select('.list-cell-attribute li'):
-                                    if "室" in tag.text and "厅" in tag.text:
-                                        house_type_text = tag.text.strip()
-                                        break
-                                
-                                # 获取建筑年份
-                                year = "未知"
-                                building_info = item.select_one('.list-cell-desc').text if item.select_one('.list-cell-desc') else ""
-                                year_match = re.search(r'(\d{4})年', building_info)
-                                if year_match:
-                                    year = year_match.group(1)
-                                
-                                # 如果指定了建筑年份筛选条件，检查是否符合
-                                if build_year and year != "未知":
-                                    if int(year) != int(build_year):
-                                        continue
-                                
-                                # 如果需要筛选几室几厅
-                                if bedroom_num or livingroom_num:
-                                    room_match = re.search(r'(\d+)室(\d+)厅', house_type_text)
-                                    if room_match:
-                                        rooms, livingrooms = int(room_match.group(1)), int(room_match.group(2))
-                                        if (bedroom_num and rooms != bedroom_num) or (livingroom_num and livingrooms != livingroom_num):
-                                            continue
-                                
-                                # 获取面积
-                                area_text = ""
-                                for tag in item.select('.list-cell-attribute li'):
-                                    area_match = re.search(r'(\d+\.?\d*)平米', tag.text)
-                                    if area_match:
-                                        area_text = area_match.group(0)
-                                        break
-                                
-                                # 构建数据项
-                                house_data = {
-                                    '平台': '58同城',
-                                    '名称': title,
-                                    '价格': price,
-                                    '位置': address,
-                                    '户型': house_type_text,
-                                    '面积': area_text,
-                                    '建筑年份': year,
-                                    '房源类型': house_type,
-                                    '城市': city,
-                                    '爬取时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                }
-                                
-                                self.house_data.append(house_data)
-                                total_items += 1
-                                print(f"已爬取: {title} - {price} - {house_type_text}")
-                                
-                            except Exception as e:
-                                print(f"处理房源项时出错: {e}")
-                
-                else:
-                    print(f"请求失败，状态码: {response.status_code}")
-                
-                # 添加随机延迟，模拟人类行为
-                time.sleep(self.get_random_delay())
-                
-            except Exception as e:
-                print(f"爬取第{page}页时出错: {e}")
-        
-        print(f"成功从58同城爬取{total_items}条{house_type}数据")
-        return total_items
-    
-    def scrape_beike(self, city, house_type, bedroom_num=None, livingroom_num=None, build_year=None, page_count=3):
-        """
-        爬取贝壳找房房源数据
-        
-        参数:
-            city: 城市名称
-            house_type: 房源类型 (新房/二手房/租房)
-            bedroom_num: 卧室数量
-            livingroom_num: 客厅数量
-            build_year: 建筑年份
-            page_count: 爬取页数
-        """
-        print(f"开始爬取贝壳找房{city}{house_type}数据")
-        if bedroom_num or livingroom_num:
-            print(f"筛选条件: {bedroom_num}室{livingroom_num}厅")
-        if build_year:
-            print(f"建筑年份: {build_year}年")
-        
-        # 构建URL - 使用城市代码而不是直接使用中文名
-        city_abbr = city  # 城市代码，例如郑州为zz
-        if house_type == '新房':
-            base_url = f"https://{city_abbr}.fang.ke.com/loupan/pg{{}}"
-        elif house_type == '二手房':
-            base_url = f"https://{city_abbr}.ke.com/ershoufang/pg{{}}"
-        else:  # 租房
-            base_url = f"https://{city_abbr}.zu.ke.com/zufang/pg{{}}"
-        
-        total_items = 0
-        verification_handled = False
-        
-        for page in range(1, page_count + 1):
-            url = base_url.format(page)
-            headers = self.update_headers()
-            
-            try:
-                print(f"正在爬取第{page}页: {url}")
-                response = requests.get(url, headers=headers, timeout=10)
-                
-                # 检查是否需要验证
-                if self.check_verification(response.text):
-                    if not verification_handled:
-                        verification_handled = self.handle_verification(url)
-                        # 如果用户选择跳过验证，继续下一页
-                        if not verification_handled:
-                            print("用户选择跳过验证，继续下一页")
-                            break
-                        # 重新请求当前页
-                        response = requests.get(url, headers=headers, timeout=10)
-                    else:
-                        print("仍然需要验证，可能验证未成功，跳过当前页")
+                                year_int = int(year)
+                                if year_int != build_year:
+                                    logger.debug(f"跳过房源 - 不符合建筑年份要求: {year} != {build_year}")
+                                    continue
+                            except ValueError:
+                                # 如果年份不是数字，则保留该房源
+                                logger.debug(f"年份 '{year}' 不是有效的数字，保留该房源")
+                                pass
+                        
+                        # 构建房源数据项
+                        house_item = {
+                            '平台': '58同城',
+                            '城市': city,
+                            '房源名称': house_name,
+                            '价格': price,
+                            '地址': address,
+                            '户型': house_type_text,
+                            '面积': area,
+                            '建筑年份': year,
+                            '类型': '新房' if house_type == 'new' else '二手房' if house_type == 'second' else '租房',
+                            '纬度': lat,
+                            '经度': lng,
+                            '详情页': detail_url,
+                            '户型图': layout_image
+                        }
+                        
+                        # 添加到数据集
+                        self.house_data.append(house_item)
+                        total_items += 1
+                        
+                    except Exception as e:
+                        logger.error(f"处理房源项时出错: {str(e)}")
                         continue
                 
-                if response.status_code == 200:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    
-                    # 根据房源类型选择不同的选择器
-                    if house_type == '新房':
-                        house_items = soup.select('.resblock-list-wrapper .resblock-list')
-                        if not house_items:
-                            print("未找到房源数据，可能需要更新选择器")
-                            continue
-                            
-                        for item in house_items:
-                            try:
-                                # 获取房源名称
-                                name = item.select_one('.resblock-name a').text.strip() if item.select_one('.resblock-name a') else "未知"
-                                
-                                # 获取房源价格
-                                price_elem = item.select_one('.number')
-                                price_unit = item.select_one('.desc')
-                                price = price_elem.text.strip() + (price_unit.text.strip() if price_unit else "") if price_elem else "未知"
-                                
-                                # 获取房源地址
-                                location = item.select_one('.resblock-location').text.strip() if item.select_one('.resblock-location') else "未知"
-                                
-                                # 获取房屋类型
-                                house_type_elem = item.select_one('.resblock-type')
-                                house_type_text = house_type_elem.text.strip() if house_type_elem else "未知"
-                                
-                                # 获取建筑年份
-                                year = "未知"
-                                for tag in item.select('.resblock-tag span'):
-                                    year_match = re.search(r'(\d{4})年', tag.text)
-                                    if year_match:
-                                        year = year_match.group(1)
-                                        break
-                                
-                                # 如果指定了建筑年份筛选条件，检查是否符合
-                                if build_year and year != "未知":
-                                    if int(year) != int(build_year):
-                                        continue
-                                
-                                # 如果需要筛选几室几厅
-                                if bedroom_num or livingroom_num:
-                                    room_spans = item.select('.resblock-room span')
-                                    for span in room_spans:
-                                        room_match = re.search(r'(\d+)室(\d+)厅', span.text)
-                                        if room_match:
-                                            rooms, livingrooms = int(room_match.group(1)), int(room_match.group(2))
-                                            if (bedroom_num and rooms != bedroom_num) or (livingroom_num and livingrooms != livingroom_num):
-                                                continue
-                                            house_type_text = span.text.strip()
-                                            break
-                                
-                                # 获取面积
-                                area_elem = item.select_one('.resblock-area')
-                                area_text = area_elem.text.strip() if area_elem else "未知"
-                                
-                                # 构建数据项
-                                house_data = {
-                                    '平台': '贝壳找房',
-                                    '名称': name,
-                                    '价格': price,
-                                    '位置': location,
-                                    '户型': house_type_text,
-                                    '面积': area_text,
-                                    '建筑年份': year,
-                                    '房源类型': house_type,
-                                    '城市': city,
-                                    '爬取时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                }
-                                
-                                self.house_data.append(house_data)
-                                total_items += 1
-                                print(f"已爬取: {name} - {price} - {house_type_text}")
-                                
-                            except Exception as e:
-                                print(f"处理房源项时出错: {e}")
-                    
-                    elif house_type == '二手房':
-                        house_items = soup.select('.sellListContent li.clear')
-                        if not house_items:
-                            print("未找到房源数据，可能需要更新选择器")
-                            continue
-                            
-                        for item in house_items:
-                            try:
-                                # 获取房源标题
-                                title = item.select_one('.title a').text.strip() if item.select_one('.title a') else "未知"
-                                
-                                # 获取房源价格
-                                total_price = item.select_one('.totalPrice span')
-                                unit_price = item.select_one('.unitPrice span')
-                                price = (total_price.text.strip() + "万" if total_price else "") + (" (" + unit_price.text.strip() + ")" if unit_price else "")
-                                
-                                # 获取房源地址
-                                address = item.select_one('.positionInfo').text.strip() if item.select_one('.positionInfo') else "未知"
-                                
-                                # 获取房屋信息
-                                house_info = item.select_one('.houseInfo').text.strip() if item.select_one('.houseInfo') else ""
-                                
-                                # 提取户型
-                                house_type_text = "未知"
-                                room_match = re.search(r'(\d+)室(\d+)厅', house_info)
-                                if room_match:
-                                    house_type_text = room_match.group(0)
-                                
-                                # 获取建筑年份
-                                year = "未知"
-                                year_match = re.search(r'(\d{4})年建', house_info)
-                                if year_match:
-                                    year = year_match.group(1)
-                                
-                                # 如果指定了建筑年份筛选条件，检查是否符合
-                                if build_year and year != "未知":
-                                    try:
-                                        if int(year) != int(build_year):
-                                            continue
-                                    except ValueError:
-                                        # 如果年份转换失败，跳过当前房源
-                                        continue
-                                
-                                # 如果需要筛选几室几厅
-                                if bedroom_num or livingroom_num:
-                                    room_match = re.search(r'(\d+)室(\d+)厅', house_type_text)
-                                    if room_match:
-                                        rooms, livingrooms = int(room_match.group(1)), int(room_match.group(2))
-                                        if (bedroom_num and rooms != bedroom_num) or (livingroom_num and livingrooms != livingroom_num):
-                                            continue
-                                
-                                # 获取面积
-                                area_text = "未知"
-                                area_match = re.search(r'(\d+\.?\d*)平米', house_info)
-                                if area_match:
-                                    area_text = area_match.group(0)
-                                
-                                # 构建数据项
-                                house_data = {
-                                    '平台': '贝壳找房',
-                                    '名称': title,
-                                    '价格': price,
-                                    '位置': address,
-                                    '户型': house_type_text,
-                                    '面积': area_text,
-                                    '建筑年份': year,
-                                    '房源类型': house_type,
-                                    '城市': city,
-                                    '爬取时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                }
-                                
-                                self.house_data.append(house_data)
-                                total_items += 1
-                                print(f"已爬取: {title} - {price} - {house_type_text}")
-                                
-                            except Exception as e:
-                                print(f"处理房源项时出错: {e}")
-                    
-                    else:  # 租房
-                        house_items = soup.select('.content__list .content__list--item')
-                        if not house_items:
-                            print("未找到房源数据，可能需要更新选择器")
-                            continue
-                            
-                        for item in house_items:
-                            try:
-                                # 获取房源标题
-                                title = item.select_one('.content__list--item--title twoline').text.strip() if item.select_one('.content__list--item--title twoline') else "未知"
-                                
-                                # 获取房源价格
-                                price_elem = item.select_one('.content__list--item-price')
-                                price = price_elem.text.strip() + "元/月" if price_elem else "未知"
-                                
-                                # 获取房源地址
-                                address = item.select_one('.content__list--item--des').text.strip() if item.select_one('.content__list--item--des') else "未知"
-                                
-                                # 获取房屋类型
-                                house_type_text = "未知"
-                                room_match = re.search(r'(\d+)室(\d+)厅', item.text)
-                                if room_match:
-                                    house_type_text = room_match.group(0)
-                                
-                                # 获取建筑年份
-                                year = "未知"
-                                year_match = re.search(r'(\d{4})年', item.text)
-                                if year_match:
-                                    year = year_match.group(1)
-                                
-                                # 如果指定了建筑年份筛选条件，检查是否符合
-                                if build_year and year != "未知":
-                                    try:
-                                        if int(year) != int(build_year):
-                                            continue
-                                    except ValueError:
-                                        # 如果年份转换失败，跳过当前房源
-                                        continue
-                                
-                                # 如果需要筛选几室几厅
-                                if bedroom_num or livingroom_num:
-                                    room_match = re.search(r'(\d+)室(\d+)厅', house_type_text)
-                                    if room_match:
-                                        rooms, livingrooms = int(room_match.group(1)), int(room_match.group(2))
-                                        if (bedroom_num and rooms != bedroom_num) or (livingroom_num and livingrooms != livingroom_num):
-                                            continue
-                                
-                                # 获取面积
-                                area_text = "未知"
-                                area_match = re.search(r'(\d+\.?\d*)平米', item.text)
-                                if area_match:
-                                    area_text = area_match.group(0)
-                                
-                                # 构建数据项
-                                house_data = {
-                                    '平台': '贝壳找房',
-                                    '名称': title,
-                                    '价格': price,
-                                    '位置': address,
-                                    '户型': house_type_text,
-                                    '面积': area_text,
-                                    '建筑年份': year,
-                                    '房源类型': house_type,
-                                    '城市': city,
-                                    '爬取时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                }
-                                
-                                self.house_data.append(house_data)
-                                total_items += 1
-                                print(f"已爬取: {title} - {price} - {house_type_text}")
-                                
-                            except Exception as e:
-                                print(f"处理房源项时出错: {e}")
-                
-                else:
-                    print(f"请求失败，状态码: {response.status_code}")
-                
-                # 添加随机延迟，模拟人类行为
-                time.sleep(self.get_random_delay())
-                
-            except Exception as e:
-                print(f"爬取第{page}页时出错: {e}")
-        
-        print(f"成功从贝壳找房爬取{total_items}条{house_type}数据")
-        return total_items
-    
-    def scrape_lianjia(self, city, house_type, bedroom_num=None, livingroom_num=None, build_year=None, page_count=3):
-        """
-        爬取链家房源数据
-        
-        参数:
-            city: 城市名称
-            house_type: 房源类型 (新房/二手房/租房)
-            bedroom_num: 卧室数量
-            livingroom_num: 客厅数量
-            build_year: 建筑年份
-            page_count: 爬取页数
-        """
-        print(f"开始爬取链家{city}{house_type}数据")
-        if bedroom_num or livingroom_num:
-            print(f"筛选条件: {bedroom_num}室{livingroom_num}厅")
-        if build_year:
-            print(f"建筑年份: {build_year}年")
-        
-        # 构建URL - 使用城市代码而不是直接使用中文名
-        # 这里使用城市简写，不要直接使用中文
-        city_abbr = city  # 城市代码，例如郑州为zz
-        if house_type == '新房':
-            base_url = f"https://{city_abbr}.fang.lianjia.com/loupan/pg{{}}"
-        elif house_type == '二手房':
-            base_url = f"https://{city_abbr}.lianjia.com/ershoufang/pg{{}}"
-        else:  # 租房
-            base_url = f"https://{city_abbr}.lianjia.com/zufang/pg{{}}"
-        
-        total_items = 0
-        verification_handled = False
-        
-        for page in range(1, page_count + 1):
-            url = base_url.format(page)
-            headers = self.update_headers()
+                # 随机延迟，避免被封
+                delay = self.get_random_delay()
+                logger.info(f"页面 {page}/{page_count} 爬取完成，延迟 {delay:.2f} 秒")
+                time.sleep(delay)
             
-            try:
-                print(f"正在爬取第{page}页: {url}")
-                response = requests.get(url, headers=headers, timeout=10)
-                
-                # 检查是否需要验证
-                if self.check_verification(response.text):
-                    if not verification_handled:
-                        verification_handled = self.handle_verification(url)
-                        # 如果用户选择跳过验证，继续下一页
-                        if not verification_handled:
-                            print("用户选择跳过验证，继续下一页")
-                            break
-                        # 重新请求当前页
-                        response = requests.get(url, headers=headers, timeout=10)
-                    else:
-                        print("仍然需要验证，可能验证未成功，跳过当前页")
-                        continue
-                
-                if response.status_code == 200:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    
-                    # 根据房源类型选择不同的选择器
-                    if house_type == '新房':
-                        house_items = soup.select('.resblock-list-wrapper .resblock-list')
-                        if not house_items:
-                            print("未找到房源数据，可能需要更新选择器")
-                            continue
-                            
-                        for item in house_items:
-                            try:
-                                # 获取房源名称
-                                name = item.select_one('.resblock-name a').text.strip() if item.select_one('.resblock-name a') else "未知"
-                                
-                                # 获取房源价格
-                                price_elem = item.select_one('.number')
-                                price_unit = item.select_one('.desc')
-                                price = price_elem.text.strip() + (price_unit.text.strip() if price_unit else "") if price_elem else "未知"
-                                
-                                # 获取房源地址
-                                location = item.select_one('.resblock-location').text.strip() if item.select_one('.resblock-location') else "未知"
-                                
-                                # 获取房屋类型
-                                house_type_elem = item.select_one('.resblock-type')
-                                house_type_text = house_type_elem.text.strip() if house_type_elem else "未知"
-                                
-                                # 获取建筑年份
-                                year = "未知"
-                                for tag in item.select('.resblock-tag span'):
-                                    year_match = re.search(r'(\d{4})年', tag.text)
-                                    if year_match:
-                                        year = year_match.group(1)
-                                        break
-                                
-                                # 如果指定了建筑年份筛选条件，检查是否符合
-                                if build_year and year != "未知":
-                                    if int(year) != int(build_year):
-                                        continue
-                                
-                                # 如果需要筛选几室几厅
-                                if bedroom_num or livingroom_num:
-                                    room_spans = item.select('.resblock-room span')
-                                    for span in room_spans:
-                                        room_match = re.search(r'(\d+)室(\d+)厅', span.text)
-                                        if room_match:
-                                            rooms, livingrooms = int(room_match.group(1)), int(room_match.group(2))
-                                            if (bedroom_num and rooms != bedroom_num) or (livingroom_num and livingrooms != livingroom_num):
-                                                continue
-                                            house_type_text = span.text.strip()
-                                            break
-                                
-                                # 获取面积
-                                area_elem = item.select_one('.resblock-area')
-                                area_text = area_elem.text.strip() if area_elem else "未知"
-                                
-                                # 构建数据项
-                                house_data = {
-                                    '平台': '链家',
-                                    '名称': name,
-                                    '价格': price,
-                                    '位置': location,
-                                    '户型': house_type_text,
-                                    '面积': area_text,
-                                    '建筑年份': year,
-                                    '房源类型': house_type,
-                                    '城市': city,
-                                    '爬取时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                }
-                                
-                                self.house_data.append(house_data)
-                                total_items += 1
-                                print(f"已爬取: {name} - {price} - {house_type_text}")
-                                
-                            except Exception as e:
-                                print(f"处理房源项时出错: {e}")
-                    
-                    elif house_type == '二手房':
-                        house_items = soup.select('.sellListContent li.clear')
-                        if not house_items:
-                            print("未找到房源数据，可能需要更新选择器")
-                            continue
-                            
-                        for item in house_items:
-                            try:
-                                # 获取房源标题
-                                title = item.select_one('.title a').text.strip() if item.select_one('.title a') else "未知"
-                                
-                                # 获取房源价格
-                                total_price = item.select_one('.totalPrice span')
-                                unit_price = item.select_one('.unitPrice span')
-                                price = (total_price.text.strip() + "万" if total_price else "") + (" (" + unit_price.text.strip() + ")" if unit_price else "")
-                                
-                                # 获取房源地址
-                                address = item.select_one('.positionInfo').text.strip() if item.select_one('.positionInfo') else "未知"
-                                
-                                # 获取房屋信息
-                                house_info = item.select_one('.houseInfo').text.strip() if item.select_one('.houseInfo') else ""
-                                
-                                # 提取户型
-                                house_type_text = "未知"
-                                room_match = re.search(r'(\d+)室(\d+)厅', house_info)
-                                if room_match:
-                                    house_type_text = room_match.group(0)
-                                
-                                # 获取建筑年份
-                                year = "未知"
-                                year_match = re.search(r'(\d{4})年建', house_info)
-                                if year_match:
-                                    year = year_match.group(1)
-                                
-                                # 如果指定了建筑年份筛选条件，检查是否符合
-                                if build_year and year != "未知":
-                                    try:
-                                        if int(year) != int(build_year):
-                                            continue
-                                    except ValueError:
-                                        # 如果年份转换失败，跳过当前房源
-                                        continue
-                                
-                                # 如果需要筛选几室几厅
-                                if bedroom_num or livingroom_num:
-                                    room_match = re.search(r'(\d+)室(\d+)厅', house_type_text)
-                                    if room_match:
-                                        rooms, livingrooms = int(room_match.group(1)), int(room_match.group(2))
-                                        if (bedroom_num and rooms != bedroom_num) or (livingroom_num and livingrooms != livingroom_num):
-                                            continue
-                                
-                                # 获取面积
-                                area_text = "未知"
-                                area_match = re.search(r'(\d+\.?\d*)平米', house_info)
-                                if area_match:
-                                    area_text = area_match.group(0)
-                                
-                                # 构建数据项
-                                house_data = {
-                                    '平台': '链家',
-                                    '名称': title,
-                                    '价格': price,
-                                    '位置': address,
-                                    '户型': house_type_text,
-                                    '面积': area_text,
-                                    '建筑年份': year,
-                                    '房源类型': house_type,
-                                    '城市': city,
-                                    '爬取时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                }
-                                
-                                self.house_data.append(house_data)
-                                total_items += 1
-                                print(f"已爬取: {title} - {price} - {house_type_text}")
-                                
-                            except Exception as e:
-                                print(f"处理房源项时出错: {e}")
-                    
-                    else:  # 租房
-                        house_items = soup.select('.content__list .content__list--item')
-                        if not house_items:
-                            print("未找到房源数据，可能需要更新选择器")
-                            continue
-                            
-                        for item in house_items:
-                            try:
-                                # 获取房源标题
-                                title = item.select_one('.content__list--item--title twoline').text.strip() if item.select_one('.content__list--item--title twoline') else "未知"
-                                
-                                # 获取房源价格
-                                price_elem = item.select_one('.content__list--item-price')
-                                price = price_elem.text.strip() + "元/月" if price_elem else "未知"
-                                
-                                # 获取房源地址
-                                address = item.select_one('.content__list--item--des').text.strip() if item.select_one('.content__list--item--des') else "未知"
-                                
-                                # 获取房屋类型
-                                house_type_text = "未知"
-                                room_match = re.search(r'(\d+)室(\d+)厅', item.text)
-                                if room_match:
-                                    house_type_text = room_match.group(0)
-                                
-                                # 获取建筑年份
-                                year = "未知"
-                                year_match = re.search(r'(\d{4})年', item.text)
-                                if year_match:
-                                    year = year_match.group(1)
-                                
-                                # 如果指定了建筑年份筛选条件，检查是否符合
-                                if build_year and year != "未知":
-                                    try:
-                                        if int(year) != int(build_year):
-                                            continue
-                                    except ValueError:
-                                        # 如果年份转换失败，跳过当前房源
-                                        continue
-                                
-                                # 如果需要筛选几室几厅
-                                if bedroom_num or livingroom_num:
-                                    room_match = re.search(r'(\d+)室(\d+)厅', house_type_text)
-                                    if room_match:
-                                        rooms, livingrooms = int(room_match.group(1)), int(room_match.group(2))
-                                        if (bedroom_num and rooms != bedroom_num) or (livingroom_num and livingrooms != livingroom_num):
-                                            continue
-                                
-                                # 获取面积
-                                area_text = "未知"
-                                area_match = re.search(r'(\d+\.?\d*)平米', item.text)
-                                if area_match:
-                                    area_text = area_match.group(0)
-                                
-                                # 构建数据项
-                                house_data = {
-                                    '平台': '链家',
-                                    '名称': title,
-                                    '价格': price,
-                                    '位置': address,
-                                    '户型': house_type_text,
-                                    '面积': area_text,
-                                    '建筑年份': year,
-                                    '房源类型': house_type,
-                                    '城市': city,
-                                    '爬取时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                }
-                                
-                                self.house_data.append(house_data)
-                                total_items += 1
-                                print(f"已爬取: {title} - {price} - {house_type_text}")
-                                
-                            except Exception as e:
-                                print(f"处理房源项时出错: {e}")
-                
-                else:
-                    print(f"请求失败，状态码: {response.status_code}")
-                
-                # 添加随机延迟，模拟人类行为
-                time.sleep(self.get_random_delay())
-                
-            except Exception as e:
-                print(f"爬取第{page}页时出错: {e}")
-        
-        print(f"成功从链家爬取{total_items}条{house_type}数据")
-        return total_items
+            print(f"58同城爬取完成，共获取 {total_items} 条{house_type}数据")
+            logger.info(f"58同城爬取完成，共获取 {total_items} 条{house_type}数据")
+            return True
+            
+        except Exception as e:
+            logger.error(f"爬取58同城数据时出错: {e}")
+            print(f"爬取58同城数据时出错: {e}")
+            return False
+    
+    def scrape_beike(self, city, house_type, bedroom_num, livingroom_num, build_year, page_count):
+        # 实现贝壳找房爬取逻辑
+        pass
+    
+    def scrape_lianjia(self, city, house_type, bedroom_num, livingroom_num, build_year, page_count):
+        # 实现链家爬取逻辑
+        pass
     
     def save_to_excel(self, filename=None):
-        """将爬取的数据保存到Excel文件中"""
+        """将爬取的数据保存到Excel文件
+        
+        参数:
+            filename: 文件名，默认为None（使用当前时间生成文件名）
+        """
         if not self.house_data:
             print("没有数据可保存")
             return None
         
+        # 如果未指定文件名，使用当前时间生成
         if not filename:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"{self.data_dir}/多平台房价数据_{timestamp}.xlsx"
+            filename = f"{self.output_dir}/house_data_{timestamp}.xlsx"
+        else:
+            # 确保文件名包含路径
+            if not os.path.dirname(filename):
+                filename = f"{self.output_dir}/{filename}"
+            # 确保文件名以.xlsx结尾
+            if not filename.endswith('.xlsx'):
+                filename = f"{filename}.xlsx"
         
-        # 按平台和房源类型分类
-        platforms = set(item['平台'] for item in self.house_data)
-        house_types = set(item.get('类型', item.get('房源类型', '未知')) for item in self.house_data)
+        # 创建输出目录
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
         
-        # 创建Excel写入器
-        with pd.ExcelWriter(filename) as writer:
-            # 总数据表 - 增加平台标识列
-            df_all = pd.DataFrame(self.house_data)
+        try:
+            # 转换为DataFrame
+            df = pd.DataFrame(self.house_data)
             
-            # 确保'平台'和'类型'(或'房源类型')列是第一列和第二列
-            if '平台' in df_all.columns:
-                cols = ['平台'] + [col for col in df_all.columns if col != '平台']
-                df_all = df_all[cols]
+            # 确保所有必要的列都存在
+            required_columns = ['平台', '城市', '房源名称', '价格', '地址', '户型', '面积', '建筑年份', '类型', '纬度', '经度', '详情页', '户型图']
+            for col in required_columns:
+                if col not in df.columns:
+                    df[col] = ""
             
-            # 统一房源类型列名
-            if '类型' in df_all.columns and '房源类型' not in df_all.columns:
-                df_all.rename(columns={'类型': '房源类型'}, inplace=True)
-            elif '房源类型' in df_all.columns and '类型' not in df_all.columns:
-                df_all.rename(columns={'房源类型': '类型'}, inplace=True)
+            # 将列重新排序
+            df = df[required_columns]
             
-            # 把类型列移到第二位
-            if '类型' in df_all.columns:
-                type_col = '类型'
-            elif '房源类型' in df_all.columns:
-                type_col = '房源类型'
-            else:
-                type_col = None
+            # 保存到Excel
+            writer = pd.ExcelWriter(filename, engine='openpyxl')
+            df.to_excel(writer, index=False, sheet_name='房源数据')
             
-            if type_col:
-                cols = [col for col in df_all.columns if col != type_col]
-                idx = min(1, len(cols))
-                cols.insert(idx, type_col)
-                df_all = df_all[cols]
+            # 自动调整列宽
+            worksheet = writer.sheets['房源数据']
+            for i, column in enumerate(df.columns):
+                max_length = max(
+                    df[column].astype(str).map(len).max(),
+                    len(column)
+                ) + 2
+                # 限制最大宽度
+                max_length = min(max_length, 50)
+                worksheet.column_dimensions[get_column_letter(i + 1)].width = max_length
             
-            # 保存全部数据
-            df_all.to_excel(writer, sheet_name='全部数据', index=False)
+            writer.close()
             
-            # 按平台分表 - 标题添加平台名称
-            for platform in platforms:
-                platform_data = [item for item in self.house_data if item['平台'] == platform]
-                if platform_data:
-                    df_platform = pd.DataFrame(platform_data)
-                    
-                    # 添加平台标识到每个表格的标题行
-                    sheet_name = f'{platform}'
-                    df_platform.to_excel(writer, sheet_name=sheet_name, index=False)
-            
-            # 按房源类型分表 - 标题添加房源类型
-            for house_type in house_types:
-                # 考虑两种可能的键名
-                type_data = [item for item in self.house_data 
-                            if item.get('类型', item.get('房源类型', '未知')) == house_type]
-                if type_data:
-                    df_type = pd.DataFrame(type_data)
-                    
-                    # 添加房源类型标识到表格
-                    sheet_name = f'{house_type}'
-                    df_type.to_excel(writer, sheet_name=sheet_name, index=False)
-            
-            # 按平台+房源类型分表 - 最清晰的分类方式
-            for platform in platforms:
-                for house_type in house_types:
-                    # 考虑两种可能的键名
-                    filtered_data = [item for item in self.house_data 
-                                    if item['平台'] == platform and 
-                                    (item.get('类型', item.get('房源类型', '未知')) == house_type)]
-                    
-                    if filtered_data:
-                        df_filtered = pd.DataFrame(filtered_data)
-                        
-                        # 创建清晰的工作表名称
-                        sheet_name = f'{platform}_{house_type}'
-                        
-                        # 如果名称过长，进行截断
-                        if len(sheet_name) > 31:  # Excel工作表名称最长31个字符
-                            sheet_name = sheet_name[:31]
-                        
-                        # 将平台名和房源类型添加到表格标题中
-                        df_filtered.to_excel(writer, sheet_name=sheet_name, index=False)
+            print(f"数据已保存到 {filename}")
+            logger.info(f"数据已保存到 {filename}")
+            return filename
         
-        print(f"数据已保存到: {filename}")
-        print(f"包含以下工作表:")
-        print(f"1. 全部数据 - 包含所有平台的所有房源数据")
-        for platform in platforms:
-            print(f"2. {platform} - 仅包含{platform}的房源数据")
-        for house_type in house_types:
-            print(f"3. {house_type} - 仅包含{house_type}类型的房源数据")
-        for platform in platforms:
-            for house_type in house_types:
-                print(f"4. {platform}_{house_type} - 仅包含{platform}的{house_type}类型房源数据")
-        
-        return filename
+        except Exception as e:
+            print(f"保存数据时出错: {e}")
+            logger.error(f"保存数据时出错: {e}")
+            traceback.print_exc()
+            return None
     
     def clear_data(self):
         """清除已爬取的数据"""
@@ -1748,7 +854,6 @@ class MultiPlatformHousingScraper:
         
         # 需要清理的目录
         dirs_to_clean = [
-            self.debug_dir,  # 调试页面
             'verification_debug'  # 验证截图
         ]
         
@@ -1794,6 +899,407 @@ class MultiPlatformHousingScraper:
                     logger.error(f"截断日志文件 {log_file} 失败: {e}")
         
         logger.info("文件清理完成")
+    
+    def analyze_data(self, save_report=True):
+        """对爬取的数据进行简单分析
+        
+        参数:
+            save_report: 是否保存分析报告到Excel
+            
+        返回:
+            分析结果的字典
+        """
+        if not self.house_data:
+            logger.warning("没有数据可供分析")
+            return None
+        
+        logger.info("开始分析房源数据...")
+        
+        # 将数据转换为DataFrame
+        df = pd.DataFrame(self.house_data)
+        
+        # 统一列名，确保后续分析不会出错
+        if '面积' in df.columns and '面积(平方米)' not in df.columns:
+            df.rename(columns={'面积': '面积(平方米)'}, inplace=True)
+        
+        # 可能的价格列名
+        price_columns = ['价格', '单价', '总价']
+        
+        # 提取数值数据（价格、面积等）
+        for col in df.columns:
+            if any(price_name in col for price_name in price_columns):
+                # 从价格文本中提取数字
+                df[f'{col}_数值'] = df[col].apply(lambda x: self._extract_number(x) if isinstance(x, str) else x)
+            
+            if '面积' in col:
+                # 从面积文本中提取数字
+                df[f'{col}_数值'] = df[col].apply(lambda x: self._extract_number(x) if isinstance(x, str) else x)
+        
+        # 准备分析结果
+        analysis_results = {
+            '数据总览': {
+                '总房源数': len(df),
+                '平台分布': df['平台'].value_counts().to_dict(),
+                '房源类型分布': df.get('类型', df.get('房源类型')).value_counts().to_dict()
+            },
+            '平台分析': {},
+            '价格分析': {},
+            '户型分析': {},
+            '区域分析': {}
+        }
+        
+        # 按平台分组统计
+        for platform, group in df.groupby('平台'):
+            analysis_results['平台分析'][platform] = {
+                '房源数量': len(group),
+                '房源类型分布': group.get('类型', group.get('房源类型')).value_counts().to_dict()
+            }
+            
+            # 如果有价格列，计算价格统计信息
+            price_numeric_cols = [col for col in group.columns if '价格' in col and '数值' in col]
+            for price_col in price_numeric_cols:
+                base_col = price_col.replace('_数值', '')
+                try:
+                    numeric_values = pd.to_numeric(group[price_col], errors='coerce')
+                    valid_values = numeric_values.dropna()
+                    
+                    if not valid_values.empty:
+                        analysis_results['平台分析'][platform][f'{base_col}统计'] = {
+                            '最低价': valid_values.min(),
+                            '最高价': valid_values.max(),
+                            '平均价': valid_values.mean(),
+                            '中位数': valid_values.median()
+                        }
+                except Exception as e:
+                    logger.warning(f"计算{platform}的{base_col}统计信息时出错: {e}")
+        
+        # 户型分析
+        if '户型' in df.columns:
+            room_counts = {}
+            for house_type in df['户型'].dropna().unique():
+                if isinstance(house_type, str):
+                    room_match = re.search(r'(\d+)室', house_type)
+                    if room_match:
+                        rooms = int(room_match.group(1))
+                        room_counts[f'{rooms}室'] = room_counts.get(f'{rooms}室', 0) + 1
+            
+            analysis_results['户型分析']['室数分布'] = room_counts
+        
+        # 区域分析
+        if '位置' in df.columns:
+            # 尝试从位置字段提取区域信息
+            regions = {}
+            for location in df['位置'].dropna().unique():
+                if isinstance(location, str):
+                    # 提取常见区域模式，如xx区、xx路等
+                    region_match = re.search(r'([^\s,，]+[区路街道])', location)
+                    if region_match:
+                        region = region_match.group(1)
+                        regions[region] = regions.get(region, 0) + df[df['位置'].str.contains(region, na=False)].shape[0]
+            
+            # 取TOP 10区域
+            top_regions = dict(sorted(regions.items(), key=lambda x: x[1], reverse=True)[:10])
+            analysis_results['区域分析']['热门区域'] = top_regions
+        
+        # 价格区间分析
+        for price_col in [col for col in df.columns if '价格' in col and '数值' in col]:
+            base_col = price_col.replace('_数值', '')
+            try:
+                numeric_values = pd.to_numeric(df[price_col], errors='coerce')
+                valid_values = numeric_values.dropna()
+                
+                if not valid_values.empty:
+                    # 计算价格统计信息
+                    analysis_results['价格分析'][base_col] = {
+                        '最低价': valid_values.min(),
+                        '最高价': valid_values.max(),
+                        '平均价': valid_values.mean(),
+                        '中位数': valid_values.median(),
+                        '标准差': valid_values.std()
+                    }
+                    
+                    # 计算价格区间分布
+                    if len(valid_values) > 1:
+                        # 按百分比生成5个区间
+                        percentiles = [0, 20, 40, 60, 80, 100]
+                        bins = [valid_values.quantile(p/100) for p in percentiles]
+                        
+                        # 确保bins是单调递增的
+                        bins = sorted(set(bins))
+                        
+                        # 统计每个区间的房源数量
+                        hist, bin_edges = np.histogram(valid_values, bins=bins)
+                        
+                        # 生成区间标签
+                        bin_labels = [f"{bin_edges[i]:.2f}-{bin_edges[i+1]:.2f}" for i in range(len(bin_edges)-1)]
+                        
+                        # 将结果保存到分析结果
+                        analysis_results['价格分析'][f'{base_col}区间分布'] = dict(zip(bin_labels, hist.tolist()))
+            except Exception as e:
+                logger.warning(f"计算{base_col}分析时出错: {e}")
+        
+        # 生成分析报告
+        if save_report and analysis_results:
+            try:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                report_file = f"{self.data_dir}/房源数据分析报告_{timestamp}.xlsx"
+                
+                with pd.ExcelWriter(report_file) as writer:
+                    # 总览
+                    overview_data = pd.DataFrame([analysis_results['数据总览']])
+                    overview_data.to_excel(writer, sheet_name='数据总览', index=False)
+                    
+                    # 平台分析
+                    platform_data = []
+                    for platform, stats in analysis_results['平台分析'].items():
+                        row = {'平台': platform, '房源数量': stats['房源数量']}
+                        
+                        # 添加价格信息
+                        for key, value in stats.items():
+                            if '价格' in key and isinstance(value, dict):
+                                for stat, stat_value in value.items():
+                                    row[f"{key}_{stat}"] = stat_value
+                        
+                        platform_data.append(row)
+                    
+                    if platform_data:
+                        pd.DataFrame(platform_data).to_excel(writer, sheet_name='平台分析', index=False)
+                    
+                    # 价格分析
+                    price_data = []
+                    for price_type, stats in analysis_results['价格分析'].items():
+                        if '区间分布' not in price_type:
+                            row = {'价格类型': price_type}
+                            row.update(stats)
+                            price_data.append(row)
+                    
+                    if price_data:
+                        pd.DataFrame(price_data).to_excel(writer, sheet_name='价格分析', index=False)
+                    
+                    # 户型分析
+                    if '室数分布' in analysis_results['户型分析']:
+                        room_data = [{'户型': k, '数量': v} for k, v in analysis_results['户型分析']['室数分布'].items()]
+                        if room_data:
+                            pd.DataFrame(room_data).to_excel(writer, sheet_name='户型分析', index=False)
+                    
+                    # 区域分析
+                    if '热门区域' in analysis_results['区域分析']:
+                        region_data = [{'区域': k, '房源数量': v} for k, v in analysis_results['区域分析']['热门区域'].items()]
+                        if region_data:
+                            pd.DataFrame(region_data).to_excel(writer, sheet_name='区域分析', index=False)
+                    
+                    # 原始数据
+                    df.to_excel(writer, sheet_name='原始数据', index=False)
+                
+                logger.info(f"分析报告已保存到: {report_file}")
+                print(f"分析报告已保存到: {report_file}")
+            
+            except Exception as e:
+                logger.error(f"保存分析报告时出错: {e}")
+        
+        return analysis_results
+    
+    def _extract_number(self, text):
+        """从文本中提取数字
+        
+        参数:
+            text: 源文本
+            
+        返回:
+            float 或 None: 提取的数字，无法提取则返回None
+        """
+        if not text or not isinstance(text, str):
+            return None
+            
+        try:
+            # 匹配浮点数或整数
+            match = re.search(r'(\d+\.?\d*)', text)
+            if match:
+                return float(match.group(1))
+        except:
+            pass
+            
+        return None
+        
+    def extract_coordinates(self, item):
+        """提取房源的经纬度坐标
+        
+        参数:
+            item: BeautifulSoup对象，表示房源项
+            
+        返回:
+            tuple: (latitude, longitude) 纬度和经度，无法提取则为None
+        """
+        if item is None:
+            return None, None
+            
+        try:
+            # 检查item类型
+            if not hasattr(item, 'prettify'):
+                return None, None
+                
+            # 转换为字符串形式用于正则匹配
+            item_str = item.prettify()
+            
+            # 常见经纬度表示形式
+            patterns = [
+                # 标准格式: lat:xx.xx, lng:yy.yy
+                r'lat[itude]*["\s\'=:]+(-?\d+\.\d+)["\s\']*[,;\s]+lon[gitude]*["\s\'=:]+(-?\d+\.\d+)',
+                
+                # 百度地图格式: BMap.Point(xx.xx, yy.yy)
+                r'BMap\.Point\((-?\d+\.\d+),\s*(-?\d+\.\d+)\)',
+                
+                # 坐标数组格式: [xx.xx, yy.yy]
+                r'coordinate["\'=:\s]+\[(-?\d+\.\d+),\s*(-?\d+\.\d+)\]',
+                
+                # 位置数据格式: position:[xx.xx, yy.yy]
+                r'position["\s\'=:\[{]+(-?\d+\.\d+)["\s\']*[,;\s]+(-?\d+\.\d+)',
+                
+                # resblock格式
+                r'resblockPosition["\s\'=:\[{]+(-?\d+\.\d+)["\s\']*[,;\s]+(-?\d+\.\d+)',
+                
+                # 百度特定格式
+                r'baidulat["\s\'=:]+(-?\d+\.\d+)["\s\']*[,;\s]+baidulon["\s\'=:]+(-?\d+\.\d+)',
+                
+                # 坐标对象格式: {lat: xx.xx, lng: yy.yy}
+                r'[\{\s]lat\s*:\s*(-?\d+\.\d+)[,\s]+lng\s*:\s*(-?\d+\.\d+)',
+                
+                # 点坐标格式: point="xx.xx,yy.yy"
+                r'point\s*=\s*["\'"](-?\d+\.\d+),(-?\d+\.\d+)',
+                
+                # 通用坐标对格式
+                r'["\']coordinates["\']\s*:\s*\[\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*\]'
+            ]
+            
+            # 遍历所有模式尝试匹配
+            for pattern in patterns:
+                match = re.search(pattern, item_str)
+                if match:
+                    return match.group(1), match.group(2)
+            
+            # 查找特定属性
+            for lat_attr, lng_attr in [
+                    ('data-lat', 'data-lng'), 
+                    ('data-latitude', 'data-longitude'),
+                    ('lat', 'lng'),
+                    ('latitude', 'longitude')
+                ]:
+                lat_elem = item.select_one(f'[{lat_attr}]')
+                lng_elem = item.select_one(f'[{lng_attr}]')
+                if lat_elem and lng_elem:
+                    return lat_elem.get(lat_attr), lng_elem.get(lng_attr)
+            
+            # 查找data-position属性
+            position_elem = item.select_one('[data-position]')
+            if position_elem:
+                position = position_elem.get('data-position')
+                match = re.search(r'(-?\d+\.\d+)[,;](\d+\.\d+)', position)
+                if match:
+                    return match.group(1), match.group(2)
+                    
+            # 查找附近元素中是否包含坐标信息
+            nearby_script = item.find_next('script')
+            if nearby_script and nearby_script.string:
+                for pattern in patterns:
+                    match = re.search(pattern, nearby_script.string)
+                    if match:
+                        return match.group(1), match.group(2)
+            
+        except Exception as e:
+            logger.debug(f"提取经纬度信息失败: {e}")
+            
+        return None, None
+    
+    def _ensure_detail_url_in_data(self):
+        """
+        确保所有58同城的数据都包含详情页链接字段
+        """
+        for item in self.house_data:
+            if item['平台'] == '58同城' and '详情页' not in item:
+                item['详情页'] = ""  # 添加空的详情页字段
+                
+        return True
+    
+    def extract_layout_image(self, item, detail_url=None):
+        """提取房源的户型图链接
+        
+        参数:
+            item: BeautifulSoup对象，表示房源项
+            detail_url: 详情页URL，如果提供则尝试访问详情页获取户型图
+            
+        返回:
+            str: 户型图链接，无法提取则为空字符串
+        """
+        if item is None:
+            return ""
+            
+        try:
+            # 检查item类型
+            if not hasattr(item, 'prettify'):
+                return ""
+                
+            # 尝试在当前页面中查找户型图
+            layout_img = None
+            
+            # 常见的户型图class和id
+            layout_selectors = [
+                "img[alt*='户型']", "img[alt*='平面']", "img[src*='hu_xing']", "img[src*='huxing']",
+                "img[src*='layout']", "img[src*='hu-xing']", ".house-layout img", ".layout-img",
+                ".hx-img", ".house-type-img", ".hu-xing", ".huxingtu", ".hu_xing", ".layout-item img"
+            ]
+            
+            # 在当前页面查找
+            for selector in layout_selectors:
+                layout_imgs = item.select(selector)
+                if layout_imgs:
+                    layout_img = layout_imgs[0]
+                    break
+            
+            # 如果找到了户型图，返回src属性
+            if layout_img and layout_img.has_attr('src'):
+                src = layout_img['src']
+                # 确保链接是完整的
+                if src.startswith('//'):
+                    return 'https:' + src
+                elif not src.startswith('http'):
+                    return 'https://' + src
+                return src
+                
+            # 如果提供了详情页URL，尝试访问详情页获取户型图
+            if detail_url and detail_url.strip():
+                try:
+                    # 访问详情页
+                    headers = self.update_headers()
+                    response = requests.get(detail_url, headers=headers, timeout=10)
+                    
+                    # 检查详情页是否需要验证
+                    if self.check_verification(response.text):
+                        logger.warning(f"获取户型图时详情页需要验证，跳过: {detail_url}")
+                        return ""
+                    
+                    if response.status_code == 200:
+                        detail_soup = BeautifulSoup(response.text, 'html.parser')
+                        
+                        # 在详情页查找户型图
+                        for selector in layout_selectors:
+                            layout_imgs = detail_soup.select(selector)
+                            if layout_imgs:
+                                layout_img = layout_imgs[0]
+                                if layout_img.has_attr('src'):
+                                    src = layout_img['src']
+                                    # 确保链接是完整的
+                                    if src.startswith('//'):
+                                        return 'https:' + src
+                                    elif not src.startswith('http'):
+                                        return 'https://' + src
+                                    return src
+                except Exception as e:
+                    logger.warning(f"访问详情页获取户型图失败: {e}, URL: {detail_url}")
+            
+        except Exception as e:
+            logger.debug(f"提取户型图失败: {e}")
+            
+        return ""
 
 
 def main():
@@ -1808,19 +1314,55 @@ def main():
     scraper.cleanup_old_files()
     
     while True:
+        print("\n主菜单:")
+        print("1. 爬取房源数据")
+        print("2. 分析已有数据")
+        print("3. 清空已有数据")
+        print("4. 退出程序")
+        
+        main_choice = input("请输入选项 (1-4): ").strip()
+        
+        if main_choice == '4':
+            print("程序已退出")
+            break
+        
+        elif main_choice == '3':
+            confirm = input("确认要清空所有已爬取的数据吗? (y/n): ").strip().lower()
+            if confirm == 'y':
+                scraper.clear_data()
+                print("数据已清空")
+            continue
+        
+        elif main_choice == '2':
+            if not scraper.house_data:
+                print("没有可分析的数据，请先爬取数据")
+                continue
+            
+            print(f"\n当前数据包含 {len(scraper.house_data)} 条房源记录")
+            confirm = input("确认要分析当前数据吗? (y/n): ").strip().lower()
+            if confirm == 'y':
+                analysis_results = scraper.analyze_data(save_report=True)
+                if analysis_results:
+                    print("\n数据分析完成，详细结果请查看生成的报告文件")
+            continue
+        
+        elif main_choice != '1':
+            print("无效选择，请重新输入")
+            continue
+        
+        # 爬取数据的选项
         print("\n请选择要爬取的平台:")
         print("1. 安居客")
         print("2. 58同城")
         print("3. 贝壳找房")
         print("4. 链家")
         print("5. 所有平台")
-        print("0. 退出程序")
+        print("0. 返回主菜单")
         
         platform_choice = input("请输入选项 (0-5): ").strip()
         
         if platform_choice == '0':
-            print("程序已退出")
-            break
+            continue
         
         if platform_choice not in ['1', '2', '3', '4', '5']:
             print("无效选择，请重新输入")
@@ -1937,10 +1479,18 @@ def main():
             if scraper.house_data:
                 save_option = input("\n是否保存数据到Excel? (y/n): ").strip().lower()
                 if save_option == 'y':
-                    scraper.save_to_excel()
+                    filename = scraper.save_to_excel()
+                    print(f"数据已保存到: {filename}")
                 
+                # 询问是否分析数据
+                analyze_option = input("\n是否分析爬取的数据? (y/n): ").strip().lower()
+                if analyze_option == 'y':
+                    analysis_results = scraper.analyze_data(save_report=True)
+                    if analysis_results:
+                        print("\n数据分析完成，详细结果请查看生成的报告文件")
+            
             # 询问是否继续
-            continue_option = input("\n是否继续爬取其他数据? (y/n): ").strip().lower()
+            continue_option = input("\n是否返回主菜单? (y/n): ").strip().lower()
             if continue_option != 'y':
                 print("程序已退出")
                 break
@@ -1962,5 +1512,180 @@ def main():
         scraper.auto_verification_handler.close_browser()
 
 
+def parse_args():
+    """解析命令行参数"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='多平台房价数据爬虫程序')
+    
+    # 通用参数
+    parser.add_argument('--debug', action='store_true', help='开启调试模式')
+    parser.add_argument('--output', type=str, help='输出文件名')
+    parser.add_argument('--clear', action='store_true', help='清空之前爬取的数据')
+    
+    # 爬取参数
+    parser.add_argument('--platform', type=str, choices=['anjuke', '58', 'beike', 'lianjia', 'all'], 
+                        help='要爬取的平台(anjuke=安居客, 58=58同城, beike=贝壳找房, lianjia=链家, all=所有平台)')
+    parser.add_argument('--city', type=str, help='城市名称或城市代码，例如: 郑州 或 zz')
+    parser.add_argument('--type', type=str, help='房源类型，多个类型用逗号分隔 (新房,二手房,租房)')
+    parser.add_argument('--pages', type=int, default=3, help='每个平台爬取的页数，默认为3')
+    
+    # 筛选参数
+    parser.add_argument('--bedroom', type=int, help='卧室数量筛选')
+    parser.add_argument('--livingroom', type=int, help='客厅数量筛选')
+    parser.add_argument('--year', type=int, help='建筑年份筛选')
+    
+    # 自动化参数
+    parser.add_argument('--headless', action='store_true', help='使用无头浏览器模式进行自动验证')
+    parser.add_argument('--no-verify', action='store_true', help='禁用自动验证，遇到验证码时直接跳过')
+    
+    # 数据分析参数
+    parser.add_argument('--analyze', action='store_true', help='爬取后自动进行数据分析')
+    parser.add_argument('--analyze-only', action='store_true', help='只分析已有数据，不进行爬取')
+    
+    args = parser.parse_args()
+    return args
+
+
+def run_with_args(args):
+    """使用命令行参数运行爬虫"""
+    # 设置调试级别
+    set_debug_level(args.debug)
+    
+    scraper = MultiPlatformHousingScraper()
+    
+    # 清理过期文件
+    scraper.cleanup_old_files()
+    
+    # 如果指定了清空数据
+    if args.clear:
+        scraper.clear_data()
+    
+    # 如果只需要分析数据
+    if args.analyze_only:
+        if not scraper.house_data:
+            logger.warning("没有数据可供分析，请先爬取数据或加载已有数据")
+            return
+        
+        logger.info("只分析已有数据，不进行爬取")
+        analysis_results = scraper.analyze_data(save_report=True)
+        if analysis_results:
+            logger.info("数据分析完成")
+        return
+    
+    # 如果没有指定平台和城市，使用交互模式
+    if not (args.platform and args.city and args.type):
+        logger.info("未指定完整的爬取参数，启动交互模式")
+        main()
+        return
+    
+    # 设置平台
+    platform_map = {
+        'anjuke': '1', 
+        '58': '2', 
+        'beike': '3', 
+        'lianjia': '4', 
+        'all': '5'
+    }
+    platform_choice = platform_map.get(args.platform)
+    if not platform_choice:
+        logger.error(f"无效的平台选择: {args.platform}")
+        return
+    
+    # 设置城市
+    city = args.city.lower()
+    if args.city in CITY_CODES:
+        city = CITY_CODES[args.city]
+        logger.info(f"已自动将城市名 '{args.city}' 转换为城市代码 '{city}'")
+    
+    # 设置房源类型
+    type_map = {
+        '新房': '1',
+        '二手房': '2',
+        '租房': '3'
+    }
+    
+    house_type_list = []
+    for house_type in args.type.split(','):
+        house_type = house_type.strip()
+        if house_type in type_map:
+            choice = type_map[house_type]
+            house_type_list.append(scraper.house_types[choice])
+        else:
+            logger.warning(f"无效的房源类型选择: {house_type}，已忽略")
+    
+    if not house_type_list:
+        logger.error("未选择有效的房源类型")
+        return
+    
+    logger.info(f"爬取平台: {args.platform}")
+    logger.info(f"爬取城市: {city}")
+    logger.info(f"爬取房源类型: {', '.join(house_type_list)}")
+    logger.info(f"爬取页数: {args.pages}")
+    
+    if args.bedroom:
+        logger.info(f"卧室数量筛选: {args.bedroom}")
+    if args.livingroom:
+        logger.info(f"客厅数量筛选: {args.livingroom}")
+    if args.year:
+        logger.info(f"建筑年份筛选: {args.year}")
+    
+    # 开始爬取数据
+    try:
+        # 为每一个选定的平台爬取所有选定的房源类型
+        if platform_choice == '5':  # 所有平台
+            for platform_id, platform_info in scraper.platforms.items():
+                for house_type in house_type_list:
+                    logger.info(f"正在爬取 {platform_info['name']} 的 {house_type} 数据...")
+                    try:
+                        platform_info['scraper'](city, house_type, args.bedroom, args.livingroom, args.year, args.pages)
+                    except Exception as e:
+                        logger.error(f"爬取 {platform_info['name']} 的 {house_type} 数据时出错: {e}")
+                        if not args.no_verify:
+                            break
+        else:
+            platform_info = scraper.platforms[platform_choice]
+            for house_type in house_type_list:
+                logger.info(f"正在爬取 {platform_info['name']} 的 {house_type} 数据...")
+                try:
+                    platform_info['scraper'](city, house_type, args.bedroom, args.livingroom, args.year, args.pages)
+                except Exception as e:
+                    logger.error(f"爬取 {platform_info['name']} 的 {house_type} 数据时出错: {e}")
+                    if not args.no_verify:
+                        break
+        
+        # 保存数据
+        if scraper.house_data:
+            filename = args.output if args.output else None
+            scraper.save_to_excel(filename)
+            logger.info("数据爬取完成并已保存")
+            
+            # 如果指定了分析数据
+            if args.analyze:
+                logger.info("开始分析爬取的数据...")
+                analysis_results = scraper.analyze_data(save_report=True)
+                if analysis_results:
+                    logger.info("数据分析完成")
+        else:
+            logger.warning("未爬取到任何数据")
+    
+    except Exception as e:
+        logger.error(f"程序执行过程中出错: {e}")
+    
+    finally:
+        # 如果使用了自动验证处理器，确保关闭浏览器
+        if scraper.auto_verification_handler:
+            scraper.auto_verification_handler.close_browser()
+
+
 if __name__ == "__main__":
-    main() 
+    import sys
+    
+    # 检查是否有命令行参数
+    if len(sys.argv) > 1:
+        # 命令行模式
+        args = parse_args()
+        run_with_args(args)
+    else:
+        # 交互模式
+        main() 
