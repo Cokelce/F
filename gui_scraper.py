@@ -9,6 +9,7 @@ import traceback
 from datetime import datetime
 from multi_platform_housing_scraper import MultiPlatformHousingScraper, CITY_CODES, set_debug_level
 import time
+import random
 
 class HousingScraperGUI:
     def __init__(self, root):
@@ -324,13 +325,12 @@ class HousingScraperGUI:
                     args=(platforms, cities, house_type, bedroom_num, livingroom_num, building_year, pages)
                 )
             else:
-                # 单个爬取
-                platform = platforms[0]
+                # 单城市多平台爬取
                 city = cities[0]
-                self.log(f"开始单个爬取 - 平台: {platform}, 城市: {city}")
+                self.log(f"开始多平台连续爬取 - 平台: {platforms}, 城市: {city}")
                 self.scraping_thread = threading.Thread(
-                    target=self.run_scraping,
-                    args=(platform, city, house_type, bedroom_num, livingroom_num, building_year, pages)
+                    target=self.run_multi_platform_scraping,
+                    args=(platforms, city, house_type, bedroom_num, livingroom_num, building_year, pages)
                 )
                 
             self.scraping_thread.daemon = True  # 设置为守护线程
@@ -361,10 +361,15 @@ class HousingScraperGUI:
         total_platforms = len(platforms)
         
         self.log(f"开始批量爬取 - {total_platforms}个平台 x {total_cities}个城市")
+        self.log(f"选择的平台: {', '.join(platforms)}")  # 添加明确的平台列表日志
         self.log(f"筛选条件 - 卧室: {bedroom_num or '不限'}, 客厅: {livingroom_num or '不限'}, 建筑年份: {building_year or '不限'}")
         self.log(f"页数: {pages}")
         
+        # 清空现有数据，为批量爬取做准备
+        self.scraper.house_data = []
+        
         # 检查是否启用跳过验证
+        original_handle_verification = None
         if self.skip_verification_var.get():
             self.log("已启用跳过验证功能")
             # 临时保存原始的验证处理方法
@@ -373,12 +378,29 @@ class HousingScraperGUI:
             # 修改验证处理方法为自动跳过
             def skip_verification_handler(platform=None, url=None):
                 self.log(f"检测到{platform or '未知平台'}验证页面，已启用跳过验证，继续爬取下一页/平台")
+                # 保存一下验证页面以便日后分析
+                if url and platform == "58":
+                    try:
+                        import requests
+                        import os
+                        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'}
+                        response = requests.get(url, headers=headers)
+                        os.makedirs('debug_pages', exist_ok=True)
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        with open(f'debug_pages/58_verification_{timestamp}.html', 'w', encoding='utf-8') as f:
+                            f.write(response.text)
+                        self.log(f"已保存验证页面至debug_pages/58_verification_{timestamp}.html")
+                    except:
+                        pass
                 return False
             
             # 替换验证处理方法
             self.scraper.handle_verification = skip_verification_handler
         
         try:
+            # 记录爬取开始前的数据量
+            initial_data_count = len(self.scraper.house_data)
+            
             # 遍历每个城市
             for i, city in enumerate(cities):
                 if self.stop_event.is_set():
@@ -387,71 +409,111 @@ class HousingScraperGUI:
                 
                 self.status_var.set(f"爬取中 - 城市 {i+1}/{total_cities}")
                 self.log(f"开始爬取城市: {city} ({i+1}/{total_cities})")
+                city_data_before = len(self.scraper.house_data)
                 
-                # 遍历每个平台
+                # 遍历每个平台 - 关键修改部分
                 for j, platform in enumerate(platforms):
                     if self.stop_event.is_set():
                         break
                     
-                    self.log(f"爬取平台: {platform} ({j+1}/{total_platforms})")
+                    self.log(f"准备爬取平台: {platform} ({j+1}/{total_platforms})")
+                    initial_platform_count = len(self.scraper.house_data)
                     
-                    try:
-                        # 调用单一爬取方法
-                        if platform == "58同城":
-                            city_abbr = CITY_CODES.get(city)
-                            if not city_abbr:
-                                self.log(f"错误: 未找到城市'{city}'的代码")
-                                continue
+                    # 分别处理每个平台
+                    if platform == "58同城":
+                        # 58同城处理逻辑
+                        city_abbr = CITY_CODES.get(city)
+                        if not city_abbr:
+                            self.log(f"错误: 未找到城市'{city}'的代码")
+                            continue  # 继续下一个平台
+                        
+                        # 房源类型映射
+                        house_type_map = {"新房": "new", "二手房": "second", "租房": "rent"}
+                        scrape_type = house_type_map.get(house_type, "second")
+                        
+                        # 58同城爬取
+                        self.log(f"开始爬取58同城 - 城市代码: {city_abbr}, 类型: {scrape_type}")
+                        
+                        # 尝试爬取
+                        max_retries = 2
+                        for retry in range(max_retries):
+                            self.log(f"58同城爬取尝试 {retry+1}/{max_retries}")
+                            if retry > 0:
+                                delay = random.uniform(5, 10)
+                                self.log(f"重试前延迟 {delay:.1f} 秒")
+                                time.sleep(delay)
                             
-                            # 根据房源类型映射
-                            house_type_map = {"新房": "new", "二手房": "second", "租房": "rent"}
-                            scrape_type = house_type_map.get(house_type, "second")
-                            
-                            result = self.scraper.scrape_58(city_abbr, scrape_type, bedroom_num, livingroom_num, building_year, pages)
-                        elif platform == "安居客":
+                            try:
+                                result = self.scraper.scrape_58(city_abbr, scrape_type, bedroom_num, livingroom_num, building_year, pages)
+                                if result:
+                                    break
+                            except Exception as e:
+                                self.log(f"58同城爬取出错: {str(e)}")
+                                if retry == max_retries - 1:
+                                    self.log("58同城爬取失败，继续下一平台")
+                    
+                    elif platform == "安居客":
+                        # 安居客处理逻辑
+                        self.log(f"开始爬取安居客 - 城市: {city}, 类型: {house_type}")
+                        try:
                             result = self.scraper.scrape_anjuke(city, house_type, bedroom_num, livingroom_num, building_year, pages)
-                        elif platform == "贝壳找房":
+                            self.log(f"安居客爬取{'成功' if result else '失败'}")
+                        except Exception as e:
+                            self.log(f"安居客爬取出错: {str(e)}")
+                    
+                    elif platform == "贝壳找房":
+                        # 贝壳找房处理逻辑
+                        self.log(f"开始爬取贝壳找房 - 城市: {city}, 类型: {house_type}")
+                        try:
                             result = self.scraper.scrape_beike(city, house_type, bedroom_num, livingroom_num, building_year, pages)
-                        elif platform == "链家":
+                            self.log(f"贝壳找房爬取{'成功' if result else '失败'}")
+                        except Exception as e:
+                            self.log(f"贝壳找房爬取出错: {str(e)}")
+                    
+                    elif platform == "链家":
+                        # 链家处理逻辑
+                        self.log(f"开始爬取链家 - 城市: {city}, 类型: {house_type}")
+                        try:
                             result = self.scraper.scrape_lianjia(city, house_type, bedroom_num, livingroom_num, building_year, pages)
-                        else:
-                            self.log(f"错误: 不支持的平台 '{platform}'")
-                            continue
-                        
-                        platform_count = len(self.scraper.house_data) - count
-                        count = len(self.scraper.house_data)
-                        self.log(f"{platform}爬取结果: {'成功' if result else '失败'}, 获取 {platform_count} 条数据")
-                        
-                    except Exception as e:
-                        self.log(f"爬取 {platform} 的 {city} 数据时出错: {str(e)}")
-                        continue
+                            self.log(f"链家爬取{'成功' if result else '失败'}")
+                        except Exception as e:
+                            self.log(f"链家爬取出错: {str(e)}")
+                    
+                    # 计算每个平台的爬取结果
+                    platform_items = len(self.scraper.house_data) - initial_platform_count
+                    self.log(f"{platform}爬取完成，获取{platform_items}条数据")
                 
-                # 在每个城市完成后自动保存一次
-                if len(self.scraper.house_data) > 0:
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    filename = self.scraper.save_to_excel(f"batch_{city}_{timestamp}.xlsx")
-                    self.log(f"城市 {city} 数据已保存到: {filename}")
-        finally:
-            # 如果启用了跳过验证，恢复原始的验证处理方法
-            if self.skip_verification_var.get():
-                self.scraper.handle_verification = original_handle_verification
+                # 计算每个城市的爬取结果
+                city_items = len(self.scraper.house_data) - city_data_before
+                self.log(f"城市 {city} 爬取完成，共获取 {city_items} 条数据")
             
-            self.log(f"批量爬取完成，共获取 {count} 条房源数据")
+            # 计算总爬取结果
+            total_items = len(self.scraper.house_data) - initial_data_count
+            self.log(f"批量爬取完成，共获取 {total_items} 条房源数据")
             
-            # 自动保存结果
-            if count > 0:
+            # 一次性保存所有数据
+            if self.scraper.house_data:
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                filename = self.scraper.save_to_excel(f"batch_house_data_{timestamp}.xlsx")
-                self.log(f"数据已保存到: {filename}")
+                filename = self.scraper.save_to_excel(f"house_data_{timestamp}.xlsx")
+                self.log(f"数据已保存到 {filename}")
+        
+        finally:
+            # 恢复原始验证处理方法
+            if original_handle_verification:
+                self.scraper.handle_verification = original_handle_verification
     
-    def run_scraping(self, platform, city, house_type, bedroom_num, livingroom_num, building_year, pages):
-        """在线程中执行爬取操作（单平台单城市）"""
+    def run_multi_platform_scraping(self, platforms, city, house_type, bedroom_num, livingroom_num, building_year, pages):
+        """执行多平台连续爬取操作（单城市多平台）"""
         try:
-            self.log(f"开始爬取 - 平台: {platform}, 城市: {city}, 类型: {house_type}")
+            self.log(f"开始多平台连续爬取 - 平台: {platforms}, 城市: {city}")
             self.log(f"筛选条件 - 卧室: {bedroom_num or '不限'}, 客厅: {livingroom_num or '不限'}, 建筑年份: {building_year or '不限'}")
             self.log(f"页数: {pages}")
             
+            # 记录爬取开始前的数据量
+            initial_data_count = len(self.scraper.house_data)
+            
             # 检查是否启用跳过验证
+            original_handle_verification = None
             if self.skip_verification_var.get():
                 self.log("已启用跳过验证功能")
                 # 临时保存原始的验证处理方法
@@ -460,62 +522,143 @@ class HousingScraperGUI:
                 # 修改验证处理方法为自动跳过
                 def skip_verification_handler(platform=None, url=None):
                     self.log(f"检测到{platform or '未知平台'}验证页面，已启用跳过验证，继续爬取下一页/平台")
+                    # 保存一下验证页面以便日后分析
+                    if url and platform == "58":
+                        try:
+                            import requests
+                            import os
+                            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'}
+                            response = requests.get(url, headers=headers)
+                            os.makedirs('debug_pages', exist_ok=True)
+                            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                            with open(f'debug_pages/58_verification_{timestamp}.html', 'w', encoding='utf-8') as f:
+                                f.write(response.text)
+                            self.log(f"已保存验证页面至debug_pages/58_verification_{timestamp}.html")
+                        except:
+                            pass
                     return False
                 
                 # 替换验证处理方法
                 self.scraper.handle_verification = skip_verification_handler
             
-            # 处理不同的爬取平台
-            result = False
             try:
-                if platform == "58同城":
-                    city_abbr = CITY_CODES.get(city)
-                    if not city_abbr:
-                        self.log(f"错误: 未找到城市'{city}'的代码")
-                        return
-                    self.log(f"58同城城市代码: {city_abbr}")
+                # 连续爬取每个平台
+                for i, platform in enumerate(platforms):
+                    if self.stop_event.is_set():
+                        self.log("爬取已手动停止")
+                        break
+                        
+                    self.status_var.set(f"爬取中 - 平台 {i+1}/{len(platforms)}")
+                    self.log(f"开始爬取平台: {platform} ({i+1}/{len(platforms)})")
+                    platform_data_before = len(self.scraper.house_data)
                     
-                    # 根据房源类型映射
-                    house_type_map = {"新房": "new", "二手房": "second", "租房": "rent"}
-                    scrape_type = house_type_map.get(house_type, "second")
-                    self.log(f"58同城爬取类型: {scrape_type}")
+                    # 处理不同的爬取平台
+                    if platform == "58同城":
+                        city_abbr = CITY_CODES.get(city)
+                        if not city_abbr:
+                            self.log(f"错误: 未找到城市'{city}'的代码")
+                            continue
+                        self.log(f"58同城城市代码: {city_abbr}")
+                        
+                        # 根据房源类型映射
+                        house_type_map = {"新房": "new", "二手房": "second", "租房": "rent"}
+                        scrape_type = house_type_map.get(house_type, "second")
+                        self.log(f"58同城爬取类型: {scrape_type}")
+                        
+                        # 58同城特别容易需要验证，尝试有限次重试
+                        max_retries = 2  # 降低最大重试次数
+                        initial_platform_count = len(self.scraper.house_data)
+                        for retry in range(max_retries):
+                            self.log(f"58同城爬取尝试 {retry+1}/{max_retries}...")
+                            
+                            # 随机延迟降低被检测概率
+                            if retry > 0:
+                                delay = random.uniform(5, 10)
+                                self.log(f"重试前随机延迟 {delay:.1f} 秒...")
+                                time.sleep(delay)
+                            
+                            try:
+                                result = self.scraper.scrape_58(city_abbr, scrape_type, bedroom_num, livingroom_num, building_year, pages)
+                                
+                                # 只要爬取过程正常完成，无论是否获取到数据，都视为成功
+                                if result:
+                                    new_data_count = len(self.scraper.house_data) - initial_platform_count
+                                    if new_data_count > 0:
+                                        self.log(f"{platform}爬取成功，获取{new_data_count}条数据")
+                                    else:
+                                        self.log(f"{platform}爬取过程完成，但未获取到任何数据，可能是没有符合条件的房源或被反爬机制拦截")
+                                    break
+                                
+                                # 爬取失败且未到最大重试次数
+                                if retry < max_retries - 1:
+                                    self.log(f"{platform}爬取未成功，将进行重试...")
+                                else:
+                                    self.log(f"{platform}多次爬取未成功，跳过此平台")
+                            except Exception as e:
+                                self.log(f"{platform}爬取出错: {str(e)}")
+                                if retry == max_retries - 1:
+                                    self.log(f"{platform}爬取失败，继续下一平台")
+                        
+                        platform_items = len(self.scraper.house_data) - initial_platform_count
+                        self.log(f"{platform}爬取结束，获取{platform_items}条数据")
+                        
+                    elif platform == "安居客":
+                        self.log(f"开始爬取安居客 - 城市: {city}, 类型: {house_type}")
+                        try:
+                            initial_platform_count = len(self.scraper.house_data)
+                            result = self.scraper.scrape_anjuke(city, house_type, bedroom_num, livingroom_num, building_year, pages)
+                            platform_items = len(self.scraper.house_data) - initial_platform_count
+                            self.log(f"{platform}爬取{'成功' if result else '失败'}，获取{platform_items}条数据")
+                        except Exception as e:
+                            self.log(f"{platform}爬取出错: {str(e)}")
+                        
+                    elif platform == "贝壳找房":
+                        self.log(f"开始爬取贝壳找房 - 城市: {city}, 类型: {house_type}")
+                        try:
+                            initial_platform_count = len(self.scraper.house_data)
+                            result = self.scraper.scrape_beike(city, house_type, bedroom_num, livingroom_num, building_year, pages)
+                            platform_items = len(self.scraper.house_data) - initial_platform_count
+                            self.log(f"{platform}爬取{'成功' if result else '失败'}，获取{platform_items}条数据")
+                        except Exception as e:
+                            self.log(f"{platform}爬取出错: {str(e)}")
+                        
+                    elif platform == "链家":
+                        self.log(f"开始爬取链家 - 城市: {city}, 类型: {house_type}")
+                        try:
+                            initial_platform_count = len(self.scraper.house_data)
+                            result = self.scraper.scrape_lianjia(city, house_type, bedroom_num, livingroom_num, building_year, pages)
+                            platform_items = len(self.scraper.house_data) - initial_platform_count
+                            self.log(f"{platform}爬取{'成功' if result else '失败'}，获取{platform_items}条数据")
+                        except Exception as e:
+                            self.log(f"{platform}爬取出错: {str(e)}")
+                        
+                    else:
+                        self.log(f"错误: 不支持的平台 '{platform}'")
+                        continue
                     
-                    result = self.scraper.scrape_58(city_abbr, scrape_type, bedroom_num, livingroom_num, building_year, pages)
-                    self.log(f"58同城爬取结果: {'成功' if result else '失败'}")
-                    
-                elif platform == "安居客":
-                    result = self.scraper.scrape_anjuke(city, house_type, bedroom_num, livingroom_num, building_year, pages)
-                    self.log(f"安居客爬取结果: {'成功' if result else '失败'}")
-                    
-                elif platform == "贝壳找房":
-                    result = self.scraper.scrape_beike(city, house_type, bedroom_num, livingroom_num, building_year, pages)
-                    self.log(f"贝壳找房爬取结果: {'成功' if result else '失败'}")
-                    
-                elif platform == "链家":
-                    result = self.scraper.scrape_lianjia(city, house_type, bedroom_num, livingroom_num, building_year, pages)
-                    self.log(f"链家爬取结果: {'成功' if result else '失败'}")
-                    
-                else:
-                    self.log(f"错误: 不支持的平台 '{platform}'")
+                    # 计算每个平台的爬取结果
+                    platform_items = len(self.scraper.house_data) - platform_data_before
+                    self.log(f"平台 {platform} 爬取完成，共获取 {platform_items} 条数据")
+                
+                # 检查是否被停止
+                if self.stop_event.is_set():
+                    self.log("爬取已手动停止")
                     return
+                
+                # 计算总爬取结果
+                total_items = len(self.scraper.house_data) - initial_data_count
+                self.log(f"多平台爬取完成，共获取 {total_items} 条房源数据")
+                
+                # 自动保存结果
+                if self.scraper.house_data:
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    filename = self.scraper.save_to_excel(f"house_data_{timestamp}.xlsx")
+                    self.log(f"数据已保存到 {filename}")
             finally:
                 # 如果启用了跳过验证，恢复原始的验证处理方法
-                if self.skip_verification_var.get():
+                if original_handle_verification:
                     self.scraper.handle_verification = original_handle_verification
-            
-            # 检查是否被停止
-            if self.stop_event.is_set():
-                self.log("爬取已手动停止")
-                return
-                
-            count = len(self.scraper.house_data)
-            self.log(f"爬取完成，共获取 {count} 条房源数据")
-            
-            # 自动保存结果
-            if count > 0:
-                filename = self.scraper.save_to_excel()
-                self.log(f"数据已保存到: {filename}")
-            
+        
         except Exception as e:
             error_msg = f"爬取过程中出错: {str(e)}"
             self.log(error_msg)
@@ -532,10 +675,25 @@ class HousingScraperGUI:
         self.root.after(0, self.update_ui_after_scraping)
     
     def update_ui_after_scraping(self):
-        """爬取完成后更新UI"""
+        """爬取结束后更新UI状态"""
         self.start_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
-        self.status_var.set(f"就绪 - 已获取 {len(self.scraper.house_data)} 条数据")
+        self.export_button.config(state=tk.NORMAL)
+        self.clear_button.config(state=tk.NORMAL)
+        self.root.update()
+        
+        # 显示当前数据条数
+        if hasattr(self, 'scraper') and self.scraper:
+            data_count = len(self.scraper.house_data)
+            self.status_var.set(f"就绪 - 当前有 {data_count} 条数据")
+            
+            # 如果爬取完成后有数据，提示用户可以导出
+            if data_count > 0:
+                self.log(f"爬取完成，获取到 {data_count} 条数据")
+                if not hasattr(self, 'exported') or not self.exported:
+                    self.log("您可以使用'导出数据'按钮保存结果")
+        else:
+            self.status_var.set("就绪")
     
     def stop_scraping(self):
         """停止爬取数据"""

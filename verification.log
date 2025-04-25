@@ -1,0 +1,90 @@
+2025-04-25 23:34:40,868 - auto_verification - INFO - 初始化自动验证处理器（简化版）
+2025-04-25 23:34:40,868 - house_scraper - INFO - 自动验证功能已启用
+2025-04-25 23:34:54,168 - house_scraper - INFO - 已关闭调试模式
+2025-04-25 23:35:07,489 - house_scraper - INFO - 已关闭调试模式
+2025-04-25 23:35:07,509 - house_scraper - INFO - 开始执行 scrape_beike
+2025-04-25 23:35:07,509 - house_scraper - INFO - 开始爬取贝壳找房-二手房，城市: 北京
+2025-04-25 23:35:07,510 - house_scraper - INFO - 筛选条件: 卧室数: 1, 客厅数: 1, 建筑年份: 2019
+2025-04-25 23:35:07,516 - house_scraper - INFO - 爬取页面: https://bj.ke.com/ershoufang/pg1/
+2025-04-25 23:35:12,822 - house_scraper - INFO - 找到 60 个房源项
+2025-04-25 23:35:12,845 - house_scraper - INFO - 已爬取贝壳找房-二手房 第 1 页, 累计 4 条数据
+2025-04-25 23:35:12,846 - house_scraper - INFO - 爬取页面: https://bj.ke.com/ershoufang/pg2/
+2025-04-25 23:35:18,518 - house_scraper - INFO - 找到 60 个房源项
+2025-04-25 23:35:18,545 - house_scraper - INFO - 已爬取贝壳找房-二手房 第 2 页, 累计 12 条数据
+2025-04-25 23:35:18,545 - house_scraper - INFO - 贝壳找房-二手房 爬取完成，共获取 12 条数据
+2025-04-25 23:35:18,547 - house_scraper - INFO - scrape_beike 执行完成
+2025-04-25 23:37:05,785 - auto_verification - INFO - 初始化自动验证处理器（简化版）
+2025-04-25 23:37:05,785 - house_scraper - INFO - 自动验证功能已启用
+2025-04-25 23:37:25,809 - house_scraper - INFO - 已关闭调试模式
+2025-04-25 23:37:25,827 - house_scraper - INFO - 开始执行 scrape_beike
+2025-04-25 23:37:25,827 - house_scraper - INFO - 开始爬取贝壳找房-二手房，城市: 北京
+2025-04-25 23:37:25,828 - house_scraper - INFO - 筛选条件: 卧室数: 1, 客厅数: 1, 建筑年份: 2019
+2025-04-25 23:37:25,828 - house_scraper - INFO - 爬取页面: https://bj.ke.com/ershoufang/pg1/
+2025-04-25 23:37:32,286 - house_scraper - INFO - 找到 60 个房源项
+2025-04-25 23:37:32,309 - house_scraper - INFO - 已爬取贝壳找房-二手房 第 1 页, 累计 4 条数据
+2025-04-25 23:37:32,309 - house_scraper - INFO - 贝壳找房-二手房 爬取完成，共获取 4 条数据
+2025-04-25 23:37:32,310 - house_scraper - INFO - scrape_beike 执行完成
+2025-04-25 23:37:32,318 - house_scraper - INFO - 正在保存数据到: output_data\house_data_20250425_233732.xlsx
+2025-04-25 23:37:33,101 - house_scraper - INFO - 数据已保存到: output_data\house_data_20250425_233732.xlsx
+2025-04-25 23:37:42,553 - house_scraper - INFO - 正在保存数据到: C:/Users/Hanyaa/Desktop/11.xlsx
+2025-04-25 23:37:42,570 - house_scraper - INFO - 数据已保存到: C:/Users/Hanyaa/Desktop/11.xlsx
+2025-04-25 23:43:38,569 - auto_verification - INFO - 初始化自动验证处理器（简化版）
+2025-04-25 23:43:38,569 - house_scraper - INFO - 自动验证功能已启用
+2025-04-25 23:44:56,769 - house_scraper - INFO - 已关闭调试模式
+2025-04-25 23:46:04,458 - auto_verification - INFO - 初始化自动验证处理器（简化版）
+2025-04-25 23:46:04,458 - house_scraper - INFO - 自动验证功能已启用
+2025-04-25 23:46:19,588 - house_scraper - INFO - 已关闭调试模式
+2025-04-25 23:46:19,611 - house_scraper - INFO - 开始执行 scrape_58
+2025-04-25 23:46:19,612 - house_scraper - INFO - 开始爬取58同城-second，城市代码: bj
+2025-04-25 23:46:19,612 - house_scraper - INFO - 筛选条件: 卧室数: 3, 客厅数: 2, 建筑年份: 2019
+2025-04-25 23:46:19,612 - house_scraper - INFO - 爬取页面: https://bj.58.com/ershoufang/p1/
+2025-04-25 23:46:24,331 - house_scraper - INFO - 检测到58同城验证关键词: 请输入验证码
+2025-04-25 23:46:24,331 - house_scraper - WARNING - 检测到58同城需要验证
+2025-04-25 23:46:26,676 - house_scraper - WARNING - 验证失败，跳过当前页面
+2025-04-25 23:46:26,676 - house_scraper - INFO - 爬取页面: https://bj.58.com/ershoufang/p2/
+2025-04-25 23:46:32,017 - house_scraper - INFO - 检测到58同城验证关键词: 请输入验证码
+2025-04-25 23:46:32,018 - house_scraper - WARNING - 检测到58同城需要验证
+2025-04-25 23:46:34,386 - house_scraper - WARNING - 验证失败，跳过当前页面
+2025-04-25 23:46:34,386 - house_scraper - INFO - 58同城-second 爬取完成，共获取 0 条数据
+2025-04-25 23:46:34,389 - house_scraper - INFO - scrape_58 执行完成
+2025-04-25 23:46:34,408 - house_scraper - INFO - 开始执行 scrape_anjuke
+2025-04-25 23:46:34,408 - house_scraper - INFO - 开始爬取安居客-二手房，城市: 北京
+2025-04-25 23:46:34,409 - house_scraper - INFO - 筛选条件: 卧室数: 3, 客厅数: 2, 建筑年份: 2019
+2025-04-25 23:46:34,409 - house_scraper - INFO - 爬取页面: 1/2, URL: https://bj.anjuke.com/sale/p1/
+2025-04-25 23:46:41,870 - house_scraper - INFO - 找到 0 个二手房项目
+2025-04-25 23:46:41,870 - house_scraper - WARNING - 未找到任何房源项，可能是被反爬或验证页面
+2025-04-25 23:46:41,870 - house_scraper - INFO - 爬取页面: 2/2, URL: https://bj.anjuke.com/sale/p2/
+2025-04-25 23:46:54,169 - house_scraper - WARNING - 安居客页面缺少正常房源元素(0/10)，可能是验证页面
+2025-04-25 23:46:54,171 - house_scraper - INFO - 找到 0 个二手房项目
+2025-04-25 23:46:54,172 - house_scraper - WARNING - 未找到任何房源项，可能是被反爬或验证页面
+2025-04-25 23:46:54,172 - house_scraper - INFO - 安居客-二手房 爬取完成，共获取 0 条数据
+2025-04-25 23:46:54,174 - house_scraper - INFO - scrape_anjuke 执行完成
+2025-04-25 23:46:54,193 - house_scraper - INFO - 开始执行 scrape_beike
+2025-04-25 23:46:54,193 - house_scraper - INFO - 开始爬取贝壳找房-二手房，城市: 北京
+2025-04-25 23:46:54,194 - house_scraper - INFO - 筛选条件: 卧室数: 3, 客厅数: 2, 建筑年份: 2019
+2025-04-25 23:46:54,194 - house_scraper - INFO - 爬取页面: https://bj.ke.com/ershoufang/pg1/
+2025-04-25 23:46:59,706 - house_scraper - INFO - 找到 60 个房源项
+2025-04-25 23:46:59,729 - house_scraper - INFO - 已爬取贝壳找房-二手房 第 1 页, 累计 0 条数据
+2025-04-25 23:46:59,729 - house_scraper - INFO - 爬取页面: https://bj.ke.com/ershoufang/pg2/
+2025-04-25 23:47:05,717 - house_scraper - INFO - 找到 60 个房源项
+2025-04-25 23:47:05,745 - house_scraper - INFO - 已爬取贝壳找房-二手房 第 2 页, 累计 2 条数据
+2025-04-25 23:47:05,745 - house_scraper - INFO - 贝壳找房-二手房 爬取完成，共获取 2 条数据
+2025-04-25 23:47:05,747 - house_scraper - INFO - scrape_beike 执行完成
+2025-04-25 23:47:05,763 - house_scraper - INFO - 开始执行 scrape_lianjia
+2025-04-25 23:47:05,764 - house_scraper - INFO - 链家爬取请求转发到贝壳找房爬虫
+2025-04-25 23:47:05,764 - house_scraper - INFO - 开始执行 scrape_beike
+2025-04-25 23:47:05,764 - house_scraper - INFO - 开始爬取贝壳找房-二手房，城市: 北京
+2025-04-25 23:47:05,764 - house_scraper - INFO - 筛选条件: 卧室数: 3, 客厅数: 2, 建筑年份: 2019
+2025-04-25 23:47:05,764 - house_scraper - INFO - 爬取页面: https://bj.ke.com/ershoufang/pg1/
+2025-04-25 23:47:11,983 - house_scraper - INFO - 找到 60 个房源项
+2025-04-25 23:47:12,008 - house_scraper - INFO - 已爬取贝壳找房-二手房 第 1 页, 累计 0 条数据
+2025-04-25 23:47:12,008 - house_scraper - INFO - 爬取页面: https://bj.ke.com/ershoufang/pg2/
+2025-04-25 23:47:16,968 - house_scraper - INFO - 找到 60 个房源项
+2025-04-25 23:47:16,991 - house_scraper - INFO - 已爬取贝壳找房-二手房 第 2 页, 累计 2 条数据
+2025-04-25 23:47:16,992 - house_scraper - INFO - 贝壳找房-二手房 爬取完成，共获取 2 条数据
+2025-04-25 23:47:16,993 - house_scraper - INFO - scrape_beike 执行完成
+2025-04-25 23:47:16,994 - house_scraper - INFO - scrape_lianjia 执行完成
+2025-04-25 23:47:17,005 - house_scraper - INFO - 正在保存数据到: output_data\house_data_20250425_234717.xlsx
+2025-04-25 23:47:17,483 - house_scraper - INFO - 数据已保存到: output_data\house_data_20250425_234717.xlsx
+2025-04-25 23:47:47,334 - house_scraper - INFO - 正在保存数据到: C:/Users/Hanyaa/Desktop/220.xlsx
+2025-04-25 23:47:47,448 - house_scraper - INFO - 数据已保存到: C:/Users/Hanyaa/Desktop/220.xlsx

@@ -180,6 +180,15 @@ scraper.analyze_data()
 
 ## 最近更新
 
+### 版本 2.0.1 (2025-04-26)
+- **修复问题**:
+  - 修复`multi_platform_housing_scraper.py`文件中的多处缩进错误，确保代码正常运行
+  - 修复`auto_verification.py`文件中的缩进错误，优化自动验证流程
+  - 添加缺失的`save_to_excel`方法，解决数据保存问题
+  - 添加缺失的爬取方法，包括`scrape_anjuke`、`scrape_beike`、`scrape_lianjia`和`scrape_58`
+  - 添加户型图提取方法`extract_layout_image`，完善数据采集功能
+  - 增强程序的稳定性，优化错误处理机制
+
 ### 版本 2.0.0 (2025-04-25)
 - **新增功能**:
   - 增加图形用户界面 (GUI) 支持，更加直观易用
